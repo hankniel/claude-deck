@@ -126,11 +126,11 @@ struct RowsScreen: View {
     let name: String
 
     var body: some View {
-        let maxV = max(doc.steps.flatMap { [$0.in ?? 0, $0.out ?? 0] }.max() ?? 1, 1)
+        let maxV = max(doc.steps.flatMap { [$0.rowsIn ?? 0, $0.out ?? 0] }.max() ?? 1, 1)
         Page {
             Text(doc.title.isEmpty ? name : doc.title).font(.title2.weight(.semibold))
             ForEach(doc.steps) { s in
-                let delta: Double? = (s.in != nil && s.out != nil) ? s.out! - s.in! : nil
+                let delta: Double? = (s.rowsIn != nil && s.out != nil) ? s.out! - s.rowsIn! : nil
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text(s.name).fontWeight(.semibold)
@@ -138,7 +138,7 @@ struct RowsScreen: View {
                         Text(s.out.map { "\(CanvasFormat.number($0)) rows" + (s.cols.map { " · \(Int($0)) cols" } ?? "") } ?? "—")
                             .monospacedDigit().foregroundStyle(.secondary)
                         if let d = delta, d != 0 {
-                            let pct = (s.in ?? 0) != 0 ? d / s.in! * 100 : 0
+                            let pct = (s.rowsIn ?? 0) != 0 ? d / s.rowsIn! * 100 : 0
                             Text("\(d > 0 ? "+" : "")\(CanvasFormat.number(d)) (\(String(format: "%+.1f", pct))%)")
                                 .monospacedDigit().fontWeight(.semibold).foregroundStyle(d < 0 ? .red : .green)
                         } else {
@@ -239,7 +239,7 @@ struct DocScreen: View {
             if !comments.isEmpty {
                 Divider()
                 ForEach(Array(comments.enumerated()), id: \.offset) { _, c in
-                    (Text("¶\(c.0) ").bold() + Text(c.2) + Text(" — \(c.1)…").foregroundStyle(.secondary))
+                    Text("\(Text("¶\(c.0) ").bold())\(c.2)\(Text(" — \(c.1)…").foregroundStyle(.secondary))")
                 }
                 Button("Send comments to agent") {
                     let choices = comments.map { "¶\($0.0)" }

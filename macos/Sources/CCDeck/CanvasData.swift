@@ -247,9 +247,11 @@ struct ReviewDoc: Codable {
 struct RowStep: Codable, Hashable, Identifiable {
     var id: String { name }
     var name: String
-    var `in`: Double?
+    var rowsIn: Double?
     var out: Double?
     var cols: Double?
+
+    enum CodingKeys: String, CodingKey { case name, rowsIn = "in", out, cols }
 }
 
 struct RowsDoc: Codable {
