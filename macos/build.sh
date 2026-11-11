@@ -17,8 +17,12 @@ if [[ "${UNIVERSAL:-}" == "1" ]]; then
   done
   CLI="$ROOT/target/claude-deck-universal"
   lipo -create -output "$CLI" "$ROOT/target/aarch64-apple-darwin/release/claude-deck" "$ROOT/target/x86_64-apple-darwin/release/claude-deck"
-  swift build -c release --sdk "$SDK" --arch arm64 --arch x86_64
-  EXE="$(swift build -c release --sdk "$SDK" --arch arm64 --arch x86_64 --show-bin-path)/CCDeck"
+  # one arch at a time: the multi-arch (xcbuild) path can't resolve SwiftTerm's build plugin
+  for a in arm64 x86_64; do swift build -c release --sdk "$SDK" --arch "$a"; done
+  EXE=".build/CCDeck-universal"
+  lipo -create -output "$EXE" \
+    "$(swift build -c release --sdk "$SDK" --arch arm64 --show-bin-path)/CCDeck" \
+    "$(swift build -c release --sdk "$SDK" --arch x86_64 --show-bin-path)/CCDeck"
 else
   cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin claude-deck
   CLI="$ROOT/target/release/claude-deck"
