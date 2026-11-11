@@ -107,6 +107,13 @@ impl JiraPage {
         filter.set_width_chars(12);
         filter.set_placeholder_text(Some("Filter by key, summary, person, epic"));
         bar.append(&filter);
+        let new_btn = gtk::MenuButton::new();
+        new_btn.set_label("New");
+        new_btn.set_icon_name("list-add-symbolic");
+        new_btn.set_tooltip_text(Some("Create an issue"));
+        let new_pop = gtk::Popover::new();
+        new_btn.set_popover(Some(&new_pop));
+        bar.append(&new_btn);
         let spinner = gtk::Spinner::new();
         bar.append(&spinner);
         let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
@@ -266,8 +273,73 @@ impl JiraPage {
             let win = b.root().and_then(|r| r.downcast::<gtk::Window>().ok());
             gtk::FileLauncher::new(Some(&gio::File::for_path(&f))).launch(win.as_ref(), None::<&gio::Cancellable>, |_| {});
         });
+        let me = Rc::downgrade(&page);
+        new_pop.connect_show(move |pop| {
+            if let Some(p) = me.upgrade() {
+                pop.set_child(Some(&p.new_issue_form(pop)));
+            }
+        });
         page.sync_bar();
         page
+    }
+
+    /// Project, type, summary → create; types come from the selected board.
+    fn new_issue_form(self: &Rc<Self>, pop: &gtk::Popover) -> gtk::Widget {
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        b.set_margin_top(10);
+        b.set_margin_bottom(10);
+        b.set_margin_start(10);
+        b.set_margin_end(10);
+        b.set_size_request(340, -1);
+        b.append(&label("New issue", &["heading"]));
+        let project = gtk::Entry::new();
+        project.set_placeholder_text(Some("Project key"));
+        project.set_text(&self.board().map(|x| s(&x["project"])).unwrap_or_default());
+        b.append(&project);
+        let mut types: Vec<String> = self.data.borrow()["types"].as_array().map(|a| a.iter().map(s).collect()).unwrap_or_default();
+        if types.is_empty() {
+            types = vec!["Task".into(), "Story".into(), "Bug".into()];
+        }
+        let refs: Vec<&str> = types.iter().map(|x| x.as_str()).collect();
+        let ty = gtk::DropDown::from_strings(&refs);
+        b.append(&ty);
+        let summary = gtk::Entry::new();
+        summary.set_placeholder_text(Some("Summary"));
+        b.append(&summary);
+        let create = gtk::Button::with_label("Create");
+        create.add_css_class("suggested-action");
+        b.append(&create);
+        let (me, pop) = (Rc::downgrade(self), pop.clone());
+        let go = move || {
+            let (proj, sum) = (project.text().trim().to_uppercase(), summary.text().trim().to_string());
+            let kind = types[ty.selected() as usize % types.len()].clone();
+            if proj.is_empty() || sum.is_empty() {
+                return;
+            }
+            pop.popdown();
+            let Some(p) = me.upgrade() else { return };
+            let me2 = Rc::downgrade(&p);
+            bg::run(
+                move || {
+                    jira::create(&jira::NewIssue { project: &proj, summary: &sum, kind: &kind, parent: None, description: None, points: None, labels: vec![], assignee: None })
+                },
+                move |r| {
+                    let Some(p) = me2.upgrade() else { return };
+                    match r {
+                        Ok(key) => {
+                            p.toast(&format!("Created {key}"));
+                            p.load(true);
+                            p.open_issue(&key);
+                        }
+                        Err(e) => p.toast(&e),
+                    }
+                },
+            );
+        };
+        let go = Rc::new(go);
+        let g2 = go.clone();
+        create.connect_clicked(move |_| g2());
+        b.upcast()
     }
 
     fn toast(&self, t: &str) {
