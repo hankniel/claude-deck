@@ -32,6 +32,9 @@ enum AppAppearance: String, CaseIterable, Identifiable {
 
 enum SidebarItem: Hashable {
     case tab(UUID)
+    case canvas
+    case board
+    case jira
     case dashboard
 }
 
@@ -57,6 +60,7 @@ final class AppState: ObservableObject {
     @Published var refreshing = false
     @Published var columns: NavigationSplitViewVisibility = .all
 
+    let canvas = CanvasModel()
     private var pickQueue: [PickRequest] = []
     private let server = ControlServer()
     private var timers: [Timer] = []
@@ -83,6 +87,10 @@ final class AppState: ObservableObject {
             }
         })
         installKeyMonitor()
+        canvas.toast = { [weak self] t in self?.flash(t) }
+        canvas.isVisible = { [weak self] in self?.selection == .canvas && NSApp.isActive }
+        canvas.onState = { [weak self] s, prev in self?.agentStateChanged(s, prev) }
+        canvas.start()
         AppAppearance.apply(AppAppearance.current)
         snapshotIfRequested()
         if Bundle.main.bundleIdentifier != nil, ProcessInfo.processInfo.environment["CC_DECK_SNAPSHOT"] == nil {
@@ -105,6 +113,9 @@ final class AppState: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [self] in
             switch mode {
             case "dashboard": selection = .dashboard
+            case "canvas": selection = .canvas
+            case "board": selection = .board
+            case "jira": selection = .jira
             case "settings": NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
             case "home": tabs.forEach { close($0) }
             case "picker":
@@ -163,6 +174,7 @@ final class AppState: ObservableObject {
     }
 
     func closeActive() {
+        if selection == .canvas, canvas.closeSelected() { return }
         if let t = activeTab { close(t) }
     }
 
@@ -194,6 +206,27 @@ final class AppState: ObservableObject {
             }
             _ = self
             return event
+        }
+    }
+
+    // MARK: canvas
+
+    func goToPane(_ pane: String) {
+        if let t = tabs.first(where: { $0.id.uuidString == pane }) { selection = .tab(t.id) }
+    }
+
+    /// Notify when an agent needs you or finished, unless you're looking at its tab.
+    private func agentStateChanged(_ s: CanvasSession, _ prev: String?) {
+        let watching: Bool = {
+            guard NSApp.isActive, case .tab(let id) = selection else { return false }
+            return id.uuidString == s.meta.pane
+        }()
+        guard !watching else { return }
+        let where_ = s.meta.project.isEmpty ? s.label : "\(s.meta.project) · \(s.label)"
+        if s.state.state == "waiting" {
+            notify("Claude needs you", "\(where_) — \(s.state.reason.isEmpty ? "waiting" : s.state.reason)")
+        } else if s.state.state == "idle", prev == "running" {
+            notify("Your turn", "\(where_) — done")
         }
     }
 
