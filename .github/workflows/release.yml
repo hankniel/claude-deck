@@ -11,7 +11,13 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - run: sudo DEBIAN_FRONTEND=noninteractive apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
+      - run: |
+          # the runners' Azure mirror stalls; use the main archive with retries
+          echo "http://archive.ubuntu.com/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+          A="-o Acquire::Retries=3 -o Acquire::http::Timeout=15"
+          sudo DEBIAN_FRONTEND=noninteractive apt-get $A update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get $A install -y -q --no-install-recommends libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
       - uses: dtolnay/rust-toolchain@stable
       - name: Build and package
         run: VERSION="${GITHUB_REF_NAME#v}" ./linux/package.sh --build
