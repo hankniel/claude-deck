@@ -23,6 +23,7 @@ Never draw one idea twice. After writing, say in one line what is on the canvas,
 | `.rv` | review findings to keep or skip | `key: file:line \| high\|medium\|low \| what \| fix` |
 | `.rows` | row counts that must survive a refactor | `step \| rows_in \| rows_out \| columns` |
 | `.doc` / `.open` | a Markdown file to comment on / a file or folder to show | one path (`path[:line]`) |
+| `.plan` | a work breakdown to push to Jira | see the jira skill |
 
 ## `.mmd` — flowcharts
 
@@ -42,7 +43,8 @@ flowchart LR
 ```
 
 `%% collapsed: a, b` (or `*`) starts groups closed; `click id "path[:line]|url" "tip"` opens a file
-or URL. Other Mermaid types are shown as source only — prefer a flowchart, `.lineage` or `.dbml`.
+or URL. `sequenceDiagram` is drawn natively too (participants, messages, notes, alt/loop blocks);
+other Mermaid types are shown as source only — prefer a flowchart, `.lineage` or `.dbml`.
 
 ## `.lineage` — Databricks-style lineage
 

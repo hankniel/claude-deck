@@ -16,6 +16,25 @@ row counts) and track work on an objectives **board**. macOS and Linux.
 └────────────────────────────┘ C-a ? help · c new · s switch account · a auto
 ```
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hankniel/claude-deck/main/install.sh | sh
+```
+
+- **macOS 26+** (Apple silicon and Intel): installs `CC Deck.app` into /Applications and links the
+  `claude-deck` CLI into `~/.local/bin`.
+- **Linux x86_64**: on Ubuntu 24.04+ / Debian 13+ installs the `.deb` with apt (GTK 4, libadwaita
+  and VTE come along); elsewhere unpacks the release into `~/.local` (needs GTK ≥ 4.14,
+  libadwaita ≥ 1.5, VTE GTK 4 ≥ 0.76 from your distribution).
+- Also adds the `deck-canvas` plugin to Claude Code when `claude` is on PATH.
+- `… | sh -s -- --source` builds from source (Rust + Xcode on macOS, GTK dev packages on Linux),
+  `--version v0.2.0` picks a release, `--no-plugin` skips the plugin, `--uninstall` removes it.
+
+Release downloads are also on the [releases page](https://github.com/hankniel/claude-deck/releases)
+(`CC-Deck-macos.zip` / `.dmg`, `cc-deck_amd64.deb`, `cc-deck-linux-x86_64.tar.gz`). The macOS app
+is not notarized; the installer clears the quarantine flag, or right-click → Open the first time.
+
 ## Desktop app (CC Deck, macOS)
 
 `macos/` is a native SwiftUI app (macOS 26+, Liquid Glass) with SwiftTerm terminals. On Linux
@@ -67,6 +86,16 @@ board edits) go back to the agent with its next prompt.
 | `.rv` | review findings to keep or skip | `key: file:line \| sev \| what \| fix` |
 | `.rows` | row counts through a pipeline | `step \| rows_in \| rows_out \| cols` |
 | `.doc` / `.open` | a Markdown file to comment on / a file or folder | a path |
+| `.plan` | a work breakdown with live Jira status, pushed to Jira on your click | Markdown-like |
+
+Mermaid `sequenceDiagram` screens are drawn natively as well.
+
+**Jira**: the Jira page lists your issues, the board (drag cards between columns), epics with
+progress and dependency graphs, and JQL search; an issue panel moves, assigns, edits, sets the
+sprint, links and comments. Credentials go in `~/.local/share/claude-deck/canvas/jira.env`
+(`JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`); agents use the same token through
+`claude-deck canvas jira …` (the plugin's `jira` skill). **Git changes** of any session or terminal
+tab open from their right-click menu.
 
 The Board lists objectives (`<canvas home>/objectives/<slug>.md`, Markdown task lists) with the
 sessions working on them and what each is doing (running / needs you / your turn); terminal tabs

@@ -1,6 +1,6 @@
 [package]
 name = "cc-deck"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "CC Deck for Linux: terminal tabs where each Claude Code session runs on the account you pick"
 license = "MIT"

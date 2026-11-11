@@ -1,6 +1,6 @@
 {
   "name": "deck-canvas",
   "description": "Canvas for CC Deck: screens (flowcharts, lineage, ERDs, reviews, row counts, documents) rendered natively by CC Deck, and an objectives board with live session state. Needs the claude-deck CLI on PATH.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": { "name": "hankniel" }
 }

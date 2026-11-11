@@ -10,6 +10,7 @@
 #   --version vX.Y  a specific release (CC_DECK_VERSION)
 #   --no-plugin     skip the Claude Code plugin (CC_DECK_NO_PLUGIN=1)
 #   --uninstall     remove the app and the CLI
+#   CC_DECK_FORMAT=tar  on Linux, the tarball into ~/.local even where apt exists
 set -eu
 
 REPO="hankniel/claude-deck"
@@ -121,7 +122,7 @@ install_macos() {
 # ---------- Linux ----------
 install_linux() {
   [ "$ARCH" = "x86_64" ] || return 1
-  if have apt-get && have dpkg; then
+  if [ "${CC_DECK_FORMAT:-}" != "tar" ] && have apt-get && have dpkg; then
     say "downloading the .deb"
     fetch "$(url cc-deck_amd64.deb)" "$TMP/cc-deck_amd64.deb" || return 1
     say "installing with apt (sudo): GTK 4, libadwaita and VTE come along"
