@@ -5,14 +5,17 @@ pub mod board;
 pub mod draw;
 pub mod erdview;
 pub mod flowview;
+pub mod gitview;
 pub mod lineageview;
+pub mod planview;
 pub mod screens;
+pub mod sequenceview;
 pub mod view;
 
 use crate::widgets::label;
 use adw::prelude::*;
 use claude_deck::canvas::store::{self, Kind, Session};
-use claude_deck::canvas::{dbml, flow, lineage};
+use claude_deck::canvas::{dbml, flow, lineage, sequence};
 use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -434,6 +437,13 @@ impl CanvasPage {
         let w = match Kind::of(name) {
             Some(Kind::Flow) => match flow::parse(&text) {
                 Ok(f) => flow_widget(f, on_open),
+                Err(flow::Error::Unsupported(k)) if k == "sequenceDiagram" => {
+                    let sq = sequence::parse(&text);
+                    let d = Diagram::new(sequenceview::SeqModel::new(sq), on_open);
+                    d.set_fit(0.6, None);
+                    keep(&d.root, d.clone());
+                    d.widget()
+                }
                 Err(flow::Error::Unsupported(k)) => screens::source(
                     &text,
                     &format!("“{k}” Mermaid diagrams are shown as source; CC Deck draws flowcharts natively. Ask for a flowchart, a .lineage or a .dbml screen for an interactive view."),
@@ -466,7 +476,7 @@ impl CanvasPage {
             }
             Some(Kind::Markdown) => screens::markdown(&text),
             Some(Kind::Html) => screens::source(&text, "HTML screens open in your browser.", Some(path.clone())),
-            Some(Kind::Plan) => screens::source(&text, "Work breakdown (.plan). Pushing plans to Jira arrives in a later CC Deck version.", None),
+            Some(Kind::Plan) => planview::plan_view(&text, path.clone(), &s.dir, self.toast_fn()),
             None => screens::source(&text, "Unknown screen type.", None),
         };
         (w, mtime)
@@ -537,6 +547,25 @@ impl CanvasPage {
         page.set_tooltip(&glib::markup_escape_text(&path.to_string_lossy()));
         page.set_icon(Some(&gio::ThemedIcon::new(if path.is_dir() { "folder-symbolic" } else { "text-x-generic-symbolic" })));
         self.open.borrow_mut().push(Open { key, page: page.clone(), holder, sid: String::new(), name: title, mtime: 0 });
+        self.select_page(&page, true);
+    }
+
+    /// Git changes of a folder, in a tab.
+    pub fn open_changes(&self, dir: &Path, title: &str) {
+        let key = format!("changes:{}", dir.display());
+        if let Some(p) = self.open.borrow().iter().find(|o| o.key == key).map(|o| o.page.clone()) {
+            self.select_page(&p, true);
+            return;
+        }
+        let w = gitview::changes(dir.to_path_buf());
+        w.set_vexpand(true);
+        let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        holder.append(&w);
+        let page = self.tabs.append(&holder);
+        page.set_title(&format!("Changes · {title}"));
+        page.set_tooltip(&glib::markup_escape_text(&dir.to_string_lossy()));
+        page.set_icon(Some(&gio::ThemedIcon::new("emblem-documents-symbolic")));
+        self.open.borrow_mut().push(Open { key, page: page.clone(), holder, sid: String::new(), name: String::new(), mtime: 0 });
         self.select_page(&page, true);
     }
 

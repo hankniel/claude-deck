@@ -205,4 +205,21 @@ vte-terminal { padding: 8px 4px 4px 14px; }
 .task-done { color: #30a46c; }
 .task-blocked { color: #e5484d; }
 .session-chip { padding: 6px 10px; }
+.status-pill { font-size: 0.75em; font-weight: 700; padding: 1px 8px; border-radius: 999px; }
+.cat-todo { background-color: alpha(currentColor, 0.10); }
+.cat-doing { background-color: alpha(#4c9ae8, 0.18); color: #3b82d0; }
+.cat-done { background-color: alpha(#30a46c, 0.18); color: #2b8f5f; }
+.type-badge { font-size: 0.72em; font-weight: 800; min-width: 18px; min-height: 18px; border-radius: 4px; color: white; background-color: #6b7785; }
+.type-story { background-color: #30a46c; } .type-bug { background-color: #e5484d; } .type-task { background-color: #4c9ae8; }
+.type-epic { background-color: #8e4ec6; } .type-subtask, .type-subtask { background-color: #7a8ca3; }
+.avatar-initials { font-size: 0.7em; font-weight: 700; min-width: 22px; min-height: 22px; border-radius: 999px; background-color: alpha(@accent_bg_color, 0.22); }
+.jira-column { padding: 10px; border-radius: 12px; background-color: alpha(currentColor, 0.04); }
+.jira-column.drop-hover { background-color: alpha(@accent_bg_color, 0.14); }
+.jira-card { padding: 10px 12px; }
+.jira-card.selected-card { box-shadow: inset 0 0 0 2px @accent_bg_color; }
+.blocked-flag { font-size: 0.72em; font-weight: 700; color: #e5484d; }
+.epic-chip { font-size: 0.72em; font-weight: 600; padding: 0 6px; border-radius: 4px; background-color: alpha(#8e4ec6, 0.16); color: #8e4ec6; }
+.comment { padding: 8px 10px; border-radius: 8px; background-color: alpha(currentColor, 0.05); }
+.git-letter { font-weight: 800; font-family: monospace; min-width: 14px; }
+.git-modified { color: #d0a215; } .git-added, .git-untracked { color: #30a46c; } .git-deleted { color: #e5484d; } .git-renamed { color: #4c9ae8; }
 "#;

@@ -4,10 +4,12 @@
 //! `claude-deck launch`), the session can be moved to another account and resumed,
 //! usage is shown per account, and idle sessions can auto-switch near a limit.
 
+mod bg;
 mod canvas;
 mod control;
 mod dashboard;
 mod deck;
+mod jira;
 mod model;
 mod picker;
 mod prefs;
@@ -139,6 +141,11 @@ fn snapshot_if_requested(d: &Rc<deck::Deck>) {
             "settings" => settings::Settings::show(&d, None),
             "picker" => d.debug_pick(),
             "board" => d.select(deck::Sel::Board),
+            "jira" => d.select(deck::Sel::Jira),
+            m if m.starts_with("changes:") => {
+                d.select(deck::Sel::Canvas);
+                d.canvas.open_changes(std::path::Path::new(&m[8..]), "repo");
+            }
             m if m.starts_with("canvas") => {
                 d.select(deck::Sel::Canvas);
                 if let Some((sid, name)) = m.strip_prefix("canvas:").and_then(|r| r.split_once('/')) {

@@ -30,10 +30,11 @@ pub enum Sel {
     Tab(String),
     Canvas,
     Board,
+    Jira,
     Dashboard,
 }
 
-const NAV: [Sel; 3] = [Sel::Canvas, Sel::Board, Sel::Dashboard];
+const NAV: [Sel; 4] = [Sel::Canvas, Sel::Board, Sel::Jira, Sel::Dashboard];
 
 pub struct Deck {
     pub app: adw::Application,
@@ -56,6 +57,7 @@ pub struct Deck {
     dashboard: Rc<Dashboard>,
     pub canvas: Rc<CanvasPage>,
     board: Rc<Board>,
+    jira: Rc<crate::jira::JiraPage>,
     canvas_fp: Cell<u64>,
     canvas_badge: gtk::Label,
     board_badge: gtk::Label,
@@ -113,6 +115,7 @@ impl Deck {
         for (icon, name, badge) in [
             ("view-paged-symbolic", "Canvas", Some(&canvas_badge)),
             ("checkbox-checked-symbolic", "Board", Some(&board_badge)),
+            ("network-server-symbolic", "Jira", None),
             ("power-profile-performance-symbolic", "Dashboard", None),
         ] {
             let b = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -240,6 +243,7 @@ impl Deck {
         banner.set_use_markup(true);
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
+        stack.set_hhomogeneous(false);
         let empty = adw::StatusPage::builder()
             .icon_name("utilities-terminal-symbolic")
             .title("No terminal open")
@@ -260,6 +264,8 @@ impl Deck {
         stack.add_named(&canvas.root, Some("canvas"));
         let board = Board::new();
         stack.add_named(&board.root, Some("board"));
+        let jira = crate::jira::JiraPage::new();
+        stack.add_named(&jira.root, Some("jira"));
         let term_model = gio::Menu::new();
         term_model.append(Some("Copy"), Some("win.copy"));
         term_model.append(Some("Paste"), Some("win.paste"));
@@ -315,6 +321,7 @@ impl Deck {
             dashboard,
             canvas,
             board,
+            jira,
             canvas_fp: Cell::new(0),
             canvas_badge,
             board_badge,
@@ -403,6 +410,7 @@ impl Deck {
             let menu = gio::Menu::new();
             menu.append(Some("Start Claude Here"), Some(&format!("win.tab-claude::{id}")));
             menu.append(Some("New Terminal in This Folder"), Some(&format!("win.tab-new-here::{id}")));
+            menu.append(Some("Git Changes"), Some(&format!("win.tab-changes::{id}")));
             let m2 = gio::Menu::new();
             m2.append(Some("Close Terminal"), Some(&format!("win.tab-close::{id}")));
             menu.append_section(None, &m2);
@@ -460,6 +468,7 @@ impl Deck {
         add("new-tab-home", Box::new(|d| d.new_tab(Some(home().to_string_lossy().to_string()), None)));
         add("canvas", Box::new(|d| d.select(Sel::Canvas)));
         add("board", Box::new(|d| d.select(Sel::Board)));
+        add("jira", Box::new(|d| d.select(Sel::Jira)));
         add("close-tab", Box::new(|d| {
             if *d.sel.borrow() == Sel::Canvas {
                 d.canvas.close_current();
@@ -532,6 +541,7 @@ impl Deck {
             ("tab-claude", 0u8),
             ("tab-new-here", 1),
             ("tab-close", 2),
+            ("tab-changes", 3),
         ] {
             let a = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
             let d = self.clone();
@@ -544,6 +554,11 @@ impl Deck {
                         t.type_text("claude\r");
                     }
                     1 => d.new_tab(Some(t.current_dir()), None),
+                    3 => {
+                        let dir = t.current_dir();
+                        d.select(Sel::Canvas);
+                        d.canvas.open_changes(Path::new(&dir), &crate::model::last_component(&dir));
+                    }
                     _ => d.close_tab(&id),
                 }
             });
@@ -559,6 +574,7 @@ impl Deck {
             ("win.dashboard", &["<Ctrl><Shift>d"]),
             ("win.canvas", &["<Ctrl><Shift>e"]),
             ("win.board", &["<Ctrl><Shift>o"]),
+            ("win.jira", &["<Ctrl><Shift>j"]),
             ("win.refresh", &["<Ctrl><Shift>r"]),
             ("win.next-tab", &["<Ctrl>Page_Down", "<Ctrl><Shift>bracketright"]),
             ("win.prev-tab", &["<Ctrl>Page_Up", "<Ctrl><Shift>bracketleft"]),
@@ -714,7 +730,7 @@ impl Deck {
                 }
                 self.stack.set_visible_child_name(id);
             }
-            Sel::Dashboard | Sel::Canvas | Sel::Board => {
+            Sel::Dashboard | Sel::Canvas | Sel::Board | Sel::Jira => {
                 self.sessions.unselect_all();
                 let i = NAV.iter().position(|n| n == &sel).unwrap_or(0);
                 if let Some(row) = self.nav.row_at_index(i as i32) {
@@ -726,6 +742,10 @@ impl Deck {
                         self.dashboard.load_if_stale();
                     }
                     Sel::Canvas => self.stack.set_visible_child_name("canvas"),
+                    Sel::Jira => {
+                        self.stack.set_visible_child_name("jira");
+                        self.jira.activate();
+                    }
                     _ => self.stack.set_visible_child_name("board"),
                 }
             }
@@ -888,6 +908,12 @@ impl Deck {
             Sel::Canvas => {
                 self.title.set_title("Canvas");
                 self.title.set_subtitle(&self.canvas.current_title());
+                self.account_btn.set_visible(false);
+                self.start_btn.set_visible(false);
+            }
+            Sel::Jira => {
+                self.title.set_title("Jira");
+                self.title.set_subtitle("");
                 self.account_btn.set_visible(false);
                 self.start_btn.set_visible(false);
             }
@@ -1321,7 +1347,25 @@ impl Deck {
             }
         });
         *self.canvas.on_toast.borrow_mut() = Some(toast.clone());
-        *self.board.on_toast.borrow_mut() = Some(toast);
+        *self.board.on_toast.borrow_mut() = Some(toast.clone());
+        *self.jira.on_toast.borrow_mut() = Some(toast);
+        let d = Rc::downgrade(self);
+        *self.jira.pick_session.borrow_mut() = Some(Rc::new(move || {
+            let d = d.upgrade()?;
+            let sessions = claude_deck::canvas::store::list_sessions();
+            let pick = sessions.iter().find(|s| !s.state.state.is_empty() && s.state.state != "ended").or(sessions.first())?;
+            let _ = d;
+            Some((pick.meta.id.clone(), pick.dir.clone()))
+        }));
+        let d = Rc::downgrade(self);
+        *self.jira.show_screen.borrow_mut() = Some(Rc::new(move |sid: &str, name: &str| {
+            if let Some(d) = d.upgrade() {
+                d.canvas_fp.set(0);
+                d.poll_canvas();
+                d.select(Sel::Canvas);
+                d.canvas.open_screen(sid, name, true);
+            }
+        }));
         let d = Rc::downgrade(self);
         *self.canvas.on_title.borrow_mut() = Some(Rc::new(move |t: &str| {
             if let Some(d) = d.upgrade() {
@@ -1353,6 +1397,7 @@ impl Deck {
                     menu.append(Some("Delete Screen"), Some(&format!("win.canvas-delete-screen::{sid}/{name}")));
                 }
                 None => {
+                    menu.append(Some("Git Changes"), Some(&format!("win.canvas-changes::{sid}")));
                     if d.canvas.session(&sid).is_some_and(|s| d.tab(&s.meta.pane).is_some()) {
                         menu.append(Some("Go to Terminal"), Some(&format!("win.canvas-goto::{sid}")));
                     }
@@ -1366,7 +1411,7 @@ impl Deck {
         });
         self.canvas.explorer().add_controller(click);
 
-        for name in ["canvas-delete-screen", "canvas-delete-session", "canvas-goto"] {
+        for name in ["canvas-delete-screen", "canvas-delete-session", "canvas-goto", "canvas-changes"] {
             let a = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
             let d = Rc::downgrade(self);
             a.connect_activate(move |a, p| {
@@ -1378,6 +1423,12 @@ impl Deck {
                         }
                     }
                     "canvas-delete-session" => d.canvas.delete_session(&arg),
+                    "canvas-changes" => {
+                        if let Some(s) = d.canvas.session(&arg) {
+                            d.select(Sel::Canvas);
+                            d.canvas.open_changes(Path::new(&s.meta.cwd), &s.meta.project);
+                        }
+                    }
                     _ => d.goto_session(&arg),
                 }
                 d.canvas_fp.set(0);
