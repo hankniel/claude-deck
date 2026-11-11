@@ -12,10 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
-          # the runners' Azure mirror stalls; use the main archive with retries
-          echo "http://archive.ubuntu.com/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
-          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
-          A="-o Acquire::Retries=3 -o Acquire::http::Timeout=15"
+          # package downloads from the runners' default mirrors stall; use an HTTPS mirror over IPv4
+          echo "https://mirrors.edge.kernel.org/ubuntu" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g; s|http://archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+          A="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::ForceIPv4=true"
           sudo DEBIAN_FRONTEND=noninteractive apt-get $A update -q
           sudo DEBIAN_FRONTEND=noninteractive apt-get $A install -y -q --no-install-recommends libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
       - uses: dtolnay/rust-toolchain@stable
