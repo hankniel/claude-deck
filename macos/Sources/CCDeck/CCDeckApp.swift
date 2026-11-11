@@ -53,6 +53,9 @@ struct CCDeckApp: App {
                 Button("Refresh Usage") { Task { await state.refresh() } }.keyboardShortcut("r", modifiers: [.command, .shift])
                 Divider()
                 Button("Dashboard") { state.selection = .dashboard }.keyboardShortcut("d", modifiers: [.command, .shift])
+                Button("Canvas") { state.selection = .canvas }.keyboardShortcut("e", modifiers: [.command, .shift])
+                Button("Board") { state.selection = .board }.keyboardShortcut("o", modifiers: [.command, .shift])
+                Button("Jira") { state.selection = .jira }.keyboardShortcut("j", modifiers: [.command, .shift])
             }
             CommandGroup(after: .windowArrangement) {
                 Divider()

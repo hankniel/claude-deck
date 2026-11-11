@@ -139,7 +139,7 @@ struct SidebarView: View {
         List(selection: $state.selection) {
             Section("Sessions") {
                 ForEach(state.tabs) { tab in
-                    TabRow(tab: tab)
+                    TabRow(tab: tab, canvas: state.canvas)
                         .tag(SidebarItem.tab(tab.id))
                         .contextMenu {
                             Button("Start Claude Here", systemImage: "sparkle") {
@@ -155,9 +155,7 @@ struct SidebarView: View {
             }
 
             Section("Insights") {
-                Label("Dashboard", systemImage: "chart.bar.xaxis")
-                    .tag(SidebarItem.dashboard)
-                    .listItemTint(Theme.accent)
+                InsightsRows(canvas: state.canvas)
             }
 
             Section {
@@ -193,14 +191,38 @@ struct SidebarView: View {
     }
 }
 
+struct InsightsRows: View {
+    @ObservedObject var canvas: CanvasModel
+
+    var body: some View {
+        Label("Canvas", systemImage: "rectangle.on.rectangle.angled")
+            .badge(canvas.unseen)
+            .tag(SidebarItem.canvas)
+            .listItemTint(Theme.accent)
+        Label("Board", systemImage: "checklist")
+            .badge(canvas.waiting.count)
+            .tag(SidebarItem.board)
+            .listItemTint(Theme.accent)
+        Label("Jira", systemImage: "square.stack.3d.up")
+            .tag(SidebarItem.jira)
+            .listItemTint(Theme.accent)
+        Label("Dashboard", systemImage: "chart.bar.xaxis")
+            .tag(SidebarItem.dashboard)
+            .listItemTint(Theme.accent)
+    }
+}
+
 struct TabRow: View {
     @ObservedObject var tab: TerminalTab
+    @ObservedObject var canvas: CanvasModel
 
     var body: some View {
         Label {
             VStack(alignment: .leading, spacing: 1) {
                 Text(tab.displayTitle).lineLimit(1)
-                Text(tab.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                let agent = tab.claude != nil ? canvas.agent(forPane: tab.id.uuidString) : nil
+                Text(agent.map { a in a.stateText.isEmpty ? tab.subtitle : "\(tab.subtitle) · \(a.stateText)" } ?? tab.subtitle)
+                    .font(.caption).foregroundStyle(agent?.needsYou == true ? Color.orange : .secondary).lineLimit(1)
             }
         } icon: {
             Image(systemName: tab.claude != nil ? "sparkle" : "terminal")
@@ -248,6 +270,12 @@ struct DetailView: View {
         switch state.selection {
         case .dashboard:
             DashboardView()
+        case .canvas:
+            CanvasPageView(model: state.canvas)
+        case .board:
+            BoardView(model: state.canvas)
+        case .jira:
+            JiraView(canvas: state.canvas)
         default:
             if let tab = state.activeTab {
                 TerminalPane(tab: tab)
