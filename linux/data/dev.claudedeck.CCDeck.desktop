@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=CC Deck
+GenericName=Claude Code Terminal
+Comment=Terminal tabs where each Claude Code session runs on the account you pick
+Exec=cc-deck
+Icon=dev.claudedeck.CCDeck
+Terminal=false
+Categories=Development;System;TerminalEmulator;GTK;
+Keywords=claude;terminal;ai;usage;account;
+StartupNotify=true
+StartupWMClass=dev.claudedeck.CCDeck

@@ -1,0 +1,39 @@
+[package]
+name = "claude-deck"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal multiplexer for Claude Code: one account per session, usage dashboard, auto-switch near limits"
+license = "MIT"
+
+[lib]
+name = "claude_deck"
+path = "src/lib.rs"
+
+[[bin]]
+name = "claude-deck"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+libc = "0.2"
+portable-pty = "0.8"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+unicode-normalization = "0.1"
+ureq = { version = "2", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
+vt100 = "0.15"
+
+[workspace]
+members = [".", "linux"]
+resolver = "2"
+
+[profile.release]
+lto = true
+strip = true

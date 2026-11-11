@@ -1,0 +1,24 @@
+[package]
+name = "cc-deck"
+version = "0.1.0"
+edition = "2021"
+description = "CC Deck for Linux: terminal tabs where each Claude Code session runs on the account you pick"
+license = "MIT"
+
+[[bin]]
+name = "cc-deck"
+path = "src/main.rs"
+
+[dependencies]
+claude-deck = { path = ".." }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+vte = { package = "vte4", version = "0.10", features = ["v0_76"] }
+pangocairo = "0.22"
+anyhow = "1"
+async-channel = "2"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
