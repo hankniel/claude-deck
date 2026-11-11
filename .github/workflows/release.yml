@@ -38,6 +38,8 @@ jobs:
         with: { name: macos, path: "macos/build/CC-Deck-macos.zip\nmacos/build/CC-Deck.dmg" }
   publish:
     needs: [linux, macos]
+    # the Linux packages can also be uploaded by hand when the runner's apt mirrors are down
+    if: ${{ !cancelled() && (needs.linux.result == 'success' || needs.macos.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
