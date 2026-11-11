@@ -4,9 +4,14 @@
 
 pub mod dbml;
 pub mod flow;
+pub mod git;
+pub mod jira;
 pub mod hooks;
 pub mod layout;
 pub mod lineage;
 pub mod objectives;
+pub mod plan;
+pub mod scene;
 pub mod screens;
+pub mod sequence;
 pub mod store;

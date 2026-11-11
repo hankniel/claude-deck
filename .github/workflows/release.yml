@@ -1,0 +1,44 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and package
+        run: VERSION="${GITHUB_REF_NAME#v}" ./linux/package.sh --build
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: dist/* }
+  macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "aarch64-apple-darwin,x86_64-apple-darwin" }
+      - name: Build universal CC Deck.app
+        run: UNIVERSAL=1 ./macos/build.sh
+      - name: Zip
+        run: cd macos/build && ditto -c -k --keepParent "CC Deck.app" CC-Deck-macos.zip
+      - uses: actions/upload-artifact@v4
+        with: { name: macos, path: "macos/build/CC-Deck-macos.zip\nmacos/build/CC-Deck.dmg" }
+  publish:
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Publish the release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          [[ "$tag" == v* ]] || tag="nightly"
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --title "CC Deck $tag" --generate-notes
+          gh release upload "$tag" dist/* -R "$GITHUB_REPOSITORY" --clobber

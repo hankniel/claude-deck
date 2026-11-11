@@ -1,3 +1,4 @@
+mod canvas_cli;
 mod keys;
 mod launch;
 mod session;
@@ -91,30 +92,7 @@ enum Cmd {
     },
     /// Canvas: screens, objectives and the agent hooks.
     #[command(subcommand)]
-    Canvas(CanvasCmd),
-}
-
-#[derive(Subcommand)]
-enum CanvasCmd {
-    /// Agent hook: reads the hook JSON on stdin (session-start, prompt-submit, state).
-    Hook { event: String },
-    /// Wait until the user answers a screen (.rv, .doc) on the canvas; prints the answer JSON.
-    Wait {
-        session_dir: PathBuf,
-        screen: String,
-        #[arg(default_value_t = 540)]
-        timeout_sec: u64,
-    },
-    /// List objectives: slug, status, progress, title.
-    Objectives,
-    /// Work this session on an objective (created if new); prints its file.
-    Attach { session_dir: PathBuf, slug: String, title: Option<String> },
-    /// Check a screen file parses; prints what it contains or its errors.
-    Check { file: PathBuf },
-    /// List canvas sessions and their screens.
-    Ls,
-    /// Print the canvas home directory.
-    Home,
+    Canvas(canvas_cli::CanvasCmd),
 }
 
 fn main() -> Result<()> {
@@ -156,7 +134,7 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&claude_deck::stats::compute(days)?)?);
             Ok(())
         }
-        Some(Cmd::Canvas(c)) => canvas_cmd(c),
+        Some(Cmd::Canvas(c)) => canvas_cli::run(c),
         Some(Cmd::Event { kind, message, account }) => {
             claude_deck::stats::log_event(&kind, account.as_deref(), &message, serde_json::json!({}));
             Ok(())
@@ -402,89 +380,3 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn canvas_cmd(c: CanvasCmd) -> Result<()> {
-    use claude_deck::canvas::{dbml, flow, hooks, lineage, objectives, screens, store};
-    match c {
-        CanvasCmd::Hook { event } => {
-            let mut input = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-            let v: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
-            // A hook must never break the agent: report and exit 0.
-            let res = match event.as_str() {
-                "session-start" => hooks::session_start(&v),
-                "prompt-submit" => hooks::prompt_submit(&v),
-                "state" => hooks::state(&v),
-                other => Err(anyhow::anyhow!("unknown hook {other}")),
-            };
-            match res {
-                Ok(Some(out)) => println!("{out}"),
-                Ok(None) => {}
-                Err(e) => eprintln!("canvas {event}: {e:#}"),
-            }
-            Ok(())
-        }
-        CanvasCmd::Wait { session_dir, screen, timeout_sec } => {
-            let v = hooks::wait(&session_dir, &screen, std::time::Duration::from_secs(timeout_sec))?;
-            println!("{v}");
-            Ok(())
-        }
-        CanvasCmd::Objectives => {
-            for o in objectives::list() {
-                println!("{}\t{}\t{}/{}\t{}", o.slug, o.status, o.done(), o.tasks.len(), o.title);
-            }
-            Ok(())
-        }
-        CanvasCmd::Attach { session_dir, slug, title } => {
-            if !session_dir.join("meta.json").exists() {
-                bail!("not a canvas session dir: {}", session_dir.display());
-            }
-            let f = objectives::create(&slug, title.as_deref().unwrap_or(""))?;
-            store::write_meta(&session_dir, |m| m.objective = slug.clone())?;
-            println!("{}", f.display());
-            Ok(())
-        }
-        CanvasCmd::Check { file } => {
-            let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
-            let name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            match store::Kind::of(&name) {
-                Some(store::Kind::Flow) => match flow::parse(&text) {
-                    Ok(f) => println!("flowchart: {} nodes ({} groups), {} edges", f.nodes.len(), f.nodes.iter().filter(|n| n.group).count(), f.edges.len()),
-                    Err(e) => bail!("{e}"),
-                },
-                Some(store::Kind::Lineage) => {
-                    let l = lineage::parse(&text);
-                    println!("lineage: {} nodes, {} edges, {} column links", l.nodes.len(), l.edges.len(), l.col_edges.len());
-                    if !l.errors.is_empty() {
-                        bail!("{}", l.errors.join("\n"));
-                    }
-                }
-                Some(store::Kind::Erd) => {
-                    let e = dbml::parse(&text);
-                    println!("dbml: {} tables, {} refs, {} enums, {} groups", e.tables.len(), e.refs.len(), e.enums.len(), e.groups.len());
-                    if !e.errors.is_empty() {
-                        bail!("{}", e.errors.join("\n"));
-                    }
-                }
-                Some(store::Kind::Review) => println!("review: {} findings", screens::parse_review(&text).findings.len()),
-                Some(store::Kind::Rows) => println!("rows: {} steps", screens::parse_rows(&text).steps.len()),
-                Some(k) => println!("{k:?}: ok"),
-                None => bail!("not a canvas screen: {name}"),
-            }
-            Ok(())
-        }
-        CanvasCmd::Ls => {
-            for s in store::list_sessions() {
-                let state = if s.state.state.is_empty() { "-" } else { &s.state.state };
-                println!("{}  {}  [{}]  {}", s.meta.id, s.meta.project, state, s.label());
-                for i in s.items.iter().take(10) {
-                    println!("    {}", i.name);
-                }
-            }
-            Ok(())
-        }
-        CanvasCmd::Home => {
-            println!("{}", store::home().display());
-            Ok(())
-        }
-    }
-}
