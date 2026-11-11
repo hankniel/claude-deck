@@ -2,6 +2,8 @@
 //! glue to `claude-deck launch` (account picker, moving sessions, auto-switch).
 
 use crate::control::{self, Conn, Msg};
+use crate::canvas::board::Board;
+use crate::canvas::CanvasPage;
 use crate::dashboard::Dashboard;
 use crate::model::{self, AccountInfo};
 use crate::picker::{PickReq, Picker};
@@ -16,7 +18,7 @@ use claude_deck::stats;
 use gtk::{gdk, gio, glib};
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,8 +28,12 @@ use std::time::{Duration, Instant};
 pub enum Sel {
     None,
     Tab(String),
+    Canvas,
+    Board,
     Dashboard,
 }
+
+const NAV: [Sel; 3] = [Sel::Canvas, Sel::Board, Sel::Dashboard];
 
 pub struct Deck {
     pub app: adw::Application,
@@ -48,6 +54,12 @@ pub struct Deck {
     account_list: gtk::ListBox,
     spinner: gtk::Spinner,
     dashboard: Rc<Dashboard>,
+    pub canvas: Rc<CanvasPage>,
+    board: Rc<Board>,
+    canvas_fp: Cell<u64>,
+    canvas_badge: gtk::Label,
+    board_badge: gtk::Label,
+    last_states: RefCell<HashMap<String, String>>,
     socket: PathBuf,
     pub cli: Option<PathBuf>,
     _server: Option<control::Server>,
@@ -96,10 +108,23 @@ impl Deck {
         sessions.add_css_class("navigation-sidebar");
         let nav = gtk::ListBox::new();
         nav.add_css_class("navigation-sidebar");
-        {
+        let canvas_badge = gtk::Label::new(None);
+        let board_badge = gtk::Label::new(None);
+        for (icon, name, badge) in [
+            ("view-paged-symbolic", "Canvas", Some(&canvas_badge)),
+            ("checkbox-checked-symbolic", "Board", Some(&board_badge)),
+            ("power-profile-performance-symbolic", "Dashboard", None),
+        ] {
             let b = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-            b.append(&gtk::Image::from_icon_name("power-profile-performance-symbolic"));
-            b.append(&label("Dashboard", &[]));
+            b.append(&gtk::Image::from_icon_name(icon));
+            let l = label(name, &[]);
+            l.set_hexpand(true);
+            b.append(&l);
+            if let Some(badge) = badge {
+                badge.add_css_class("nav-badge");
+                badge.set_visible(false);
+                b.append(badge);
+            }
             b.set_margin_top(4);
             b.set_margin_bottom(4);
             nav.append(&b);
@@ -231,6 +256,10 @@ impl Deck {
         stack.add_named(&empty, Some("empty"));
         let dashboard = Dashboard::new();
         stack.add_named(&dashboard.root, Some("dashboard"));
+        let canvas = CanvasPage::new();
+        stack.add_named(&canvas.root, Some("canvas"));
+        let board = Board::new();
+        stack.add_named(&board.root, Some("board"));
         let term_model = gio::Menu::new();
         term_model.append(Some("Copy"), Some("win.copy"));
         term_model.append(Some("Paste"), Some("win.paste"));
@@ -284,6 +313,12 @@ impl Deck {
             account_list,
             spinner,
             dashboard,
+            canvas,
+            board,
+            canvas_fp: Cell::new(0),
+            canvas_badge,
+            board_badge,
+            last_states: RefCell::new(HashMap::new()),
             socket,
             cli,
             _server: server,
@@ -301,6 +336,7 @@ impl Deck {
             banner_target: RefCell::new(None),
         });
         deck.dashboard.set_deck(Rc::downgrade(&deck));
+        deck.wire_canvas();
         deck.connect_signals();
         deck.install_actions();
 
@@ -311,6 +347,11 @@ impl Deck {
             }
         });
 
+        let d = deck.clone();
+        glib::timeout_add_local(Duration::from_millis(900), move || {
+            d.poll_canvas();
+            glib::ControlFlow::Continue
+        });
         let d = deck.clone();
         glib::timeout_add_seconds_local(2, move || {
             d.auto_switch_tick();
@@ -374,8 +415,11 @@ impl Deck {
 
         let d = self.clone();
         self.nav.connect_row_selected(move |_, row| {
-            if !d.syncing.get() && row.is_some() {
-                d.select(Sel::Dashboard);
+            if d.syncing.get() {
+                return;
+            }
+            if let Some(sel) = row.and_then(|r| NAV.get(r.index() as usize)) {
+                d.select(sel.clone());
             }
         });
         let d = self.clone();
@@ -414,7 +458,13 @@ impl Deck {
         };
         add("new-tab", Box::new(|d| d.new_tab(None, None)));
         add("new-tab-home", Box::new(|d| d.new_tab(Some(home().to_string_lossy().to_string()), None)));
+        add("canvas", Box::new(|d| d.select(Sel::Canvas)));
+        add("board", Box::new(|d| d.select(Sel::Board)));
         add("close-tab", Box::new(|d| {
+            if *d.sel.borrow() == Sel::Canvas {
+                d.canvas.close_current();
+                return;
+            }
             if let Some(t) = d.active_tab() {
                 d.close_tab(&t.id);
             }
@@ -507,6 +557,8 @@ impl Deck {
             ("win.close-tab", &["<Ctrl><Shift>w"]),
             ("win.start-claude", &["<Ctrl><Shift>k"]),
             ("win.dashboard", &["<Ctrl><Shift>d"]),
+            ("win.canvas", &["<Ctrl><Shift>e"]),
+            ("win.board", &["<Ctrl><Shift>o"]),
             ("win.refresh", &["<Ctrl><Shift>r"]),
             ("win.next-tab", &["<Ctrl>Page_Down", "<Ctrl><Shift>bracketright"]),
             ("win.prev-tab", &["<Ctrl>Page_Up", "<Ctrl><Shift>bracketleft"]),
@@ -662,13 +714,20 @@ impl Deck {
                 }
                 self.stack.set_visible_child_name(id);
             }
-            Sel::Dashboard => {
+            Sel::Dashboard | Sel::Canvas | Sel::Board => {
                 self.sessions.unselect_all();
-                if let Some(row) = self.nav.row_at_index(0) {
+                let i = NAV.iter().position(|n| n == &sel).unwrap_or(0);
+                if let Some(row) = self.nav.row_at_index(i as i32) {
                     self.nav.select_row(Some(&row));
                 }
-                self.stack.set_visible_child_name("dashboard");
-                self.dashboard.load_if_stale();
+                match sel {
+                    Sel::Dashboard => {
+                        self.stack.set_visible_child_name("dashboard");
+                        self.dashboard.load_if_stale();
+                    }
+                    Sel::Canvas => self.stack.set_visible_child_name("canvas"),
+                    _ => self.stack.set_visible_child_name("board"),
+                }
             }
             Sel::None => {
                 self.sessions.unselect_all();
@@ -721,8 +780,15 @@ impl Deck {
             let v = gtk::Box::new(gtk::Orientation::Vertical, 1);
             let t = label(&tab.display_title(), &[]);
             t.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            let s = label(&tab.subtitle(), &["caption", "dim-label"]);
+            let agent = self.agent_session(&tab.id);
+            let state = agent.as_ref().map(crate::canvas::state_text).unwrap_or_default();
+            let sub = if state.is_empty() || tab.claude.borrow().is_none() { tab.subtitle() } else { format!("{} · {state}", tab.subtitle()) };
+            let s = label(&sub, &["caption", "dim-label"]);
             s.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            if agent.as_ref().is_some_and(|a| a.needs_you()) && tab.claude.borrow().is_some() {
+                s.remove_css_class("dim-label");
+                s.add_css_class("warning");
+            }
             v.append(&t);
             v.append(&s);
             b.append(&v);
@@ -818,6 +884,18 @@ impl Deck {
                         self.start_btn.set_visible(true);
                     }
                 }
+            }
+            Sel::Canvas => {
+                self.title.set_title("Canvas");
+                self.title.set_subtitle(&self.canvas.current_title());
+                self.account_btn.set_visible(false);
+                self.start_btn.set_visible(false);
+            }
+            Sel::Board => {
+                self.title.set_title("Board");
+                self.title.set_subtitle("");
+                self.account_btn.set_visible(false);
+                self.start_btn.set_visible(false);
             }
             Sel::Dashboard => {
                 self.title.set_title("Dashboard");
@@ -1231,6 +1309,165 @@ impl Deck {
 
     pub fn debug_dash_scroll(&self, frac: f64) {
         self.dashboard.scroll_to(frac);
+    }
+
+    // ---------- canvas ----------
+
+    fn wire_canvas(self: &Rc<Self>) {
+        let d = Rc::downgrade(self);
+        let toast: Rc<dyn Fn(&str)> = Rc::new(move |s: &str| {
+            if let Some(d) = d.upgrade() {
+                d.toast(s);
+            }
+        });
+        *self.canvas.on_toast.borrow_mut() = Some(toast.clone());
+        *self.board.on_toast.borrow_mut() = Some(toast);
+        let d = Rc::downgrade(self);
+        *self.canvas.on_title.borrow_mut() = Some(Rc::new(move |t: &str| {
+            if let Some(d) = d.upgrade() {
+                if *d.sel.borrow() == Sel::Canvas {
+                    d.title.set_subtitle(t);
+                }
+            }
+        }));
+        let d = Rc::downgrade(self);
+        *self.board.on_goto.borrow_mut() = Some(Rc::new(move |s: &claude_deck::canvas::store::Session| {
+            if let Some(d) = d.upgrade() {
+                d.goto_session(&s.meta.id);
+            }
+        }));
+
+        // right-click in the canvas explorer
+        let pop = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
+        pop.set_parent(self.canvas.explorer());
+        pop.set_has_arrow(false);
+        let click = gtk::GestureClick::new();
+        click.set_button(3);
+        let d = Rc::downgrade(self);
+        click.connect_pressed(move |_, _, x, y| {
+            let Some(d) = d.upgrade() else { return };
+            let Some((sid, screen)) = d.canvas.target_at(y) else { return };
+            let menu = gio::Menu::new();
+            match screen {
+                Some(name) => {
+                    menu.append(Some("Delete Screen"), Some(&format!("win.canvas-delete-screen::{sid}/{name}")));
+                }
+                None => {
+                    if d.canvas.session(&sid).is_some_and(|s| d.tab(&s.meta.pane).is_some()) {
+                        menu.append(Some("Go to Terminal"), Some(&format!("win.canvas-goto::{sid}")));
+                    }
+                    menu.append(Some("Delete Session"), Some(&format!("win.canvas-delete-session::{sid}")));
+                }
+            }
+            pop.set_menu_model(Some(&menu));
+            pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            pop.popup();
+            pop.present();
+        });
+        self.canvas.explorer().add_controller(click);
+
+        for name in ["canvas-delete-screen", "canvas-delete-session", "canvas-goto"] {
+            let a = gio::SimpleAction::new(name, Some(glib::VariantTy::STRING));
+            let d = Rc::downgrade(self);
+            a.connect_activate(move |a, p| {
+                let (Some(d), Some(arg)) = (d.upgrade(), p.and_then(|v| v.get::<String>())) else { return };
+                match a.name().as_str() {
+                    "canvas-delete-screen" => {
+                        if let Some((sid, name)) = arg.split_once('/') {
+                            d.canvas.delete_screen(sid, name);
+                        }
+                    }
+                    "canvas-delete-session" => d.canvas.delete_session(&arg),
+                    _ => d.goto_session(&arg),
+                }
+                d.canvas_fp.set(0);
+                d.poll_canvas();
+            });
+            self.window.add_action(&a);
+        }
+    }
+
+    /// The canvas session of the agent running in a CC Deck tab, if any.
+    fn agent_session(&self, tab_id: &str) -> Option<claude_deck::canvas::store::Session> {
+        self.canvas
+            .sessions()
+            .into_iter()
+            .filter(|s| s.meta.pane == tab_id && s.state.state != "ended")
+            .max_by_key(|s| s.updated)
+    }
+
+    /// Its terminal tab when it runs in CC Deck, else its screens on the canvas.
+    fn goto_session(self: &Rc<Self>, sid: &str) {
+        let Some(s) = self.canvas.session(sid) else { return };
+        if self.tab(&s.meta.pane).is_some() {
+            self.select(Sel::Tab(s.meta.pane.clone()));
+            return;
+        }
+        self.select(Sel::Canvas);
+        if let Some(it) = s.items.first() {
+            self.canvas.open_screen(sid, &it.name, true);
+        }
+    }
+
+    fn poll_canvas(self: &Rc<Self>) {
+        let fp = claude_deck::canvas::store::fingerprint();
+        if fp == self.canvas_fp.get() {
+            return;
+        }
+        let first = self.canvas_fp.get() == 0 && self.last_states.borrow().is_empty();
+        self.canvas_fp.set(fp);
+        let sessions = claude_deck::canvas::store::list_sessions();
+        let visible = *self.sel.borrow() == Sel::Canvas;
+        let changed = self.canvas.update(sessions.clone(), visible);
+        self.board.update(sessions.clone());
+
+        let waiting = sessions.iter().filter(|s| s.needs_you()).count();
+        self.board_badge.set_text(&waiting.to_string());
+        self.board_badge.set_visible(waiting > 0);
+        if !changed.is_empty() && !visible {
+            let n = self.canvas_badge.text().parse::<usize>().unwrap_or(0) + changed.len();
+            self.canvas_badge.set_text(&n.to_string());
+            self.canvas_badge.set_visible(true);
+            let (sid, name) = changed[0].clone();
+            let t = adw::Toast::builder().title(format!("New on the canvas: {name}")).button_label("Show").timeout(8).build();
+            let d = Rc::downgrade(self);
+            t.connect_button_clicked(move |_| {
+                if let Some(d) = d.upgrade() {
+                    d.select(Sel::Canvas);
+                    d.canvas.open_screen(&sid, &name, true);
+                }
+            });
+            self.toasts.add_toast(t);
+        }
+        if visible {
+            self.canvas_badge.set_visible(false);
+            self.canvas_badge.set_text("0");
+        }
+
+        // state changes of agents: tab subtitles, notifications
+        let mut last = self.last_states.borrow_mut();
+        for s in &sessions {
+            let prev = last.insert(s.meta.id.clone(), s.state.state.clone());
+            if first || prev.as_deref() == Some(s.state.state.as_str()) {
+                continue;
+            }
+            let where_ = if s.meta.project.is_empty() { s.label() } else { format!("{} · {}", s.meta.project, s.label()) };
+            let in_view = matches!(&*self.sel.borrow(), Sel::Tab(id) if *id == s.meta.pane) && self.window.is_active();
+            match s.state.state.as_str() {
+                "waiting" if !in_view => {
+                    self.notify("Claude needs you", &format!("{where_} — {}", if s.state.reason.is_empty() { "waiting" } else { &s.state.reason }));
+                }
+                "idle" if !in_view && prev.as_deref() == Some("running") => {
+                    self.notify("Your turn", &format!("{where_} — done"));
+                }
+                _ => {}
+            }
+        }
+        drop(last);
+        self.rebuild_sessions();
+        if *self.sel.borrow() == Sel::Canvas {
+            self.title.set_subtitle(&self.canvas.current_title());
+        }
     }
 
     /// Development aid: type `claude` in the active tab so the real picker flow runs.

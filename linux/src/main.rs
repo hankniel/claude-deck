@@ -4,6 +4,7 @@
 //! `claude-deck launch`), the session can be moved to another account and resumed,
 //! usage is shown per account, and idle sessions can auto-switch near a limit.
 
+mod canvas;
 mod control;
 mod dashboard;
 mod deck;
@@ -107,6 +108,8 @@ const SHORTCUTS_UI: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child><object class="GtkShortcutsShortcut"><property name="title">Start Claude in this terminal</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;k</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Refresh usage</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;r</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Dashboard</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;d</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Canvas</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;e</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Board</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;o</property></object></child>
           </object>
         </child>
         <child>
@@ -135,6 +138,13 @@ fn snapshot_if_requested(d: &Rc<deck::Deck>) {
             "dashboard" => d.select(deck::Sel::Dashboard),
             "settings" => settings::Settings::show(&d, None),
             "picker" => d.debug_pick(),
+            "board" => d.select(deck::Sel::Board),
+            m if m.starts_with("canvas") => {
+                d.select(deck::Sel::Canvas);
+                if let Some((sid, name)) = m.strip_prefix("canvas:").and_then(|r| r.split_once('/')) {
+                    d.canvas.open_screen(sid, name, true);
+                }
+            }
             "claude" => {
                 d.debug_pick();
                 let d2 = d.clone();

@@ -189,4 +189,20 @@ pub const CSS: &str = r#"
 .event-icon { border-radius: 999px; min-width: 24px; min-height: 24px; background-color: alpha(@accent_bg_color, 0.14); color: @accent_color; }
 .event-icon.limit { background-color: alpha(#f0902e, 0.16); color: #d0731a; }
 vte-terminal { padding: 8px 4px 4px 14px; }
+.nav-badge { font-size: 0.75em; font-weight: 700; padding: 0 7px; border-radius: 999px; background-color: @accent_bg_color; color: @accent_fg_color; }
+.osd-tools { background-color: alpha(@window_bg_color, 0.92); border-radius: 8px; box-shadow: 0 1px 4px alpha(black, 0.18); }
+.osd-tools button { min-height: 28px; min-width: 30px; }
+.osd-title { padding: 5px 10px; border-radius: 8px; background-color: alpha(@window_bg_color, 0.92); box-shadow: 0 1px 4px alpha(black, 0.14); }
+.sev { font-size: 0.75em; font-weight: 700; padding: 1px 8px; border-radius: 999px; min-width: 52px; }
+.sev-high { background-color: alpha(#e5484d, 0.16); color: #d13a3f; }
+.sev-medium { background-color: alpha(#f0902e, 0.18); color: #c26a10; }
+.sev-low, .sev-note { background-color: alpha(currentColor, 0.10); }
+.code-block { padding: 10px 12px; border-radius: 8px; background-color: alpha(currentColor, 0.06); font-size: 0.92em; }
+.doc-list, .doc-list row { background: none; }
+.doc-list row.commented { box-shadow: inset 3px 0 @accent_bg_color; }
+.task-state { min-width: 26px; padding: 0 4px; font-size: 1.15em; }
+.task-doing { color: @accent_color; }
+.task-done { color: #30a46c; }
+.task-blocked { color: #e5484d; }
+.session-chip { padding: 6px 10px; }
 "#;

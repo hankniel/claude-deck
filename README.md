@@ -1,7 +1,9 @@
 # claude-deck
 
-Terminal multiplexer for Claude Code. Each tab runs `claude` on the account you pick, with live
-5-hour / 7-day usage per account and optional auto-switch before a limit. macOS and Linux.
+Terminal app for Claude Code. Each tab runs `claude` on the account you pick, with live
+5-hour / 7-day usage per account and optional auto-switch before a limit; agents draw on a
+native **canvas** (flowcharts, Databricks-style lineage, dbdiagram-style ERDs, review findings,
+row counts) and track work on an objectives **board**. macOS and Linux.
 
 ```
 ┌ accounts ──────────────────┐ 1 work · claude-config   2 personal · dbt
@@ -50,6 +52,38 @@ Shortcuts follow Linux terminals: Ctrl+Shift+T/W new/close tab, Ctrl+Shift+K sta
 Ctrl+Shift+C/V copy/paste, Alt+1–9 tabs, Ctrl+Shift+D dashboard, F9 sidebar, Ctrl+? all.
 `CC_DECK_SNAPSHOT=out.png CC_DECK_SNAPSHOT_MODE=dashboard|settings|picker cc-deck` renders the
 window to a PNG and quits (development aid).
+
+## Canvas and board
+
+Agents write small text files ("screens") into their session folder; CC Deck's Canvas page renders
+them natively and reloads them as they change. Answers (kept review findings, document comments,
+board edits) go back to the agent with its next prompt.
+
+| Screen | Shows | Format |
+|---|---|---|
+| `.mmd` | interactive flowchart: collapsible groups, click-to-trace, search, links to files | Mermaid flowchart |
+| `.lineage` | data lineage like Databricks Unity Catalog: entity cards, columns, column-level tracing | `a, b > c > d`, `t.col < s.col` |
+| `.dbml` | database diagram like dbdiagram.io: draggable tables, crow's-foot relations, groups, enums | DBML |
+| `.rv` | review findings to keep or skip | `key: file:line \| sev \| what \| fix` |
+| `.rows` | row counts through a pipeline | `step \| rows_in \| rows_out \| cols` |
+| `.doc` / `.open` | a Markdown file to comment on / a file or folder | a path |
+
+The Board lists objectives (`<canvas home>/objectives/<slug>.md`, Markdown task lists) with the
+sessions working on them and what each is doing (running / needs you / your turn); terminal tabs
+show the same state, and CC Deck notifies you when an agent needs you.
+
+Install the agent side (hooks + the `canvas` skill that teaches the formats) as a Claude Code plugin:
+
+```text
+/plugin marketplace add hankniel/claude-deck
+/plugin install deck-canvas@claude-deck
+```
+
+Codex: merge `plugin/codex_hooks.json` into `~/.codex/hooks.json` and link
+`plugin/skills/canvas` into `~/.agents/skills`. The hooks call `claude-deck canvas hook …`, so the
+CLI must be on PATH. `claude-deck canvas check <file>` validates a screen; `claude-deck canvas
+wait|objectives|attach|ls|home` are the agent's tools. Canvas data lives in
+`~/.local/share/claude-deck/canvas` (`CANVAS_HOME` overrides).
 
 ## CLI / TUI install
 

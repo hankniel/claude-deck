@@ -1,0 +1,28 @@
+{
+  "description": "CC Deck canvas sessions for Codex",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v claude-deck >/dev/null 2>&1 && CANVAS_AGENT=Codex claude-deck canvas hook session-start || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v claude-deck >/dev/null 2>&1 && claude-deck canvas hook prompt-submit || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

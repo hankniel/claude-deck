@@ -1,0 +1,12 @@
+{
+  "name": "claude-deck",
+  "owner": { "name": "hankniel" },
+  "plugins": [
+    {
+      "name": "deck-canvas",
+      "source": "./plugin",
+      "description": "Canvas for CC Deck: agents draw flowcharts, Databricks-style lineage, dbdiagram-style ERDs, review findings and row counts that CC Deck renders natively; objectives board with live session state.",
+      "version": "0.1.0"
+    }
+  ]
+}

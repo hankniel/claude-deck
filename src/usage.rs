@@ -83,10 +83,33 @@ pub fn fetch(acc: &Account) -> Usage {
             Err(e) => return Usage::Error(format!("bad response: {e}")),
         },
         Err(ureq::Error::Status(401, _)) => return Usage::Expired,
-        Err(ureq::Error::Status(code, _)) => return Usage::Error(format!("HTTP {code}")),
-        Err(e) => return Usage::Error(e.to_string()),
+        Err(ureq::Error::Status(code, _)) => return cached(acc, oauth.plan).unwrap_or(Usage::Error(format!("HTTP {code}"))),
+        Err(e) => return cached(acc, oauth.plan).unwrap_or(Usage::Error(e.to_string())),
     };
+    let _ = save_cache(acc, &body);
     parse(&body, oauth.plan)
+}
+
+/// The last good answer is kept so a rate limit or a network blip doesn't blank the numbers.
+fn cache_path(acc: &Account) -> std::path::PathBuf {
+    crate::config::data_dir().join("usage-cache").join(format!("{}.json", acc.name))
+}
+
+fn save_cache(acc: &Account, body: &serde_json::Value) -> std::io::Result<()> {
+    let p = cache_path(acc);
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(p, serde_json::json!({ "at": Utc::now().timestamp(), "body": body }).to_string())
+}
+
+fn cached(acc: &Account, plan: Option<String>) -> Option<Usage> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(cache_path(acc)).ok()?).ok()?;
+    let age = Utc::now().timestamp() - v.get("at")?.as_i64()?;
+    if age >= 30 * 60 {
+        return None;
+    }
+    Some(parse(v.get("body")?, plan))
 }
 
 fn parse(body: &serde_json::Value, plan: Option<String>) -> Usage {
