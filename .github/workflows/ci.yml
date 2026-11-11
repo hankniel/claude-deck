@@ -6,16 +6,19 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: GTK, libadwaita and VTE
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
+        timeout-minutes: 10
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo build --release -p claude-deck -p cc-deck
   macos:
     runs-on: macos-26
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -8,9 +8,10 @@ permissions:
 jobs:
   linux:
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
+      - run: sudo DEBIAN_FRONTEND=noninteractive apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
       - uses: dtolnay/rust-toolchain@stable
       - name: Build and package
         run: VERSION="${GITHUB_REF_NAME#v}" ./linux/package.sh --build
@@ -18,6 +19,7 @@ jobs:
         with: { name: linux, path: dist/* }
   macos:
     runs-on: macos-26
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,6 +33,7 @@ jobs:
   publish:
     needs: [linux, macos]
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
