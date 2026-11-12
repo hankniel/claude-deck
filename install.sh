@@ -58,6 +58,23 @@ fetch() { # url dest → 0 when downloaded
 
 sudo_() { if [ "$(id -u)" = "0" ]; then "$@"; else sudo "$@"; fi; }
 
+# Root, a cached sudo, or a terminal sudo can ask the password on.
+can_sudo() {
+  [ "$(id -u)" = "0" ] && return 0
+  have sudo || return 1
+  sudo -n true 2>/dev/null && return 0
+  (exec </dev/tty) 2>/dev/null
+}
+
+# GTK 4.14+, libadwaita 1.5+ and VTE (GTK 4) 0.76+ present at runtime?
+linux_runtime_ok() {
+  have ldconfig || return 1
+  libs="$(ldconfig -p 2>/dev/null)"
+  for l in libgtk-4.so.1 libadwaita-1.so.0 libvte-2.91-gtk4.so.0; do
+    case "$libs" in *"$l"*) ;; *) return 1 ;; esac
+  done
+}
+
 link_cli() { # path to the claude-deck binary
   mkdir -p "$BIN_DIR"
   ln -sf "$1" "$BIN_DIR/claude-deck"
@@ -92,7 +109,11 @@ from_source() {
     xcrun --find swift >/dev/null 2>&1 || die "Xcode 26 is needed to build the macOS app (or install a release without --source)"
     "$SRC/macos/build.sh" --install
   else
-    if have apt-get; then
+    if pkg-config --exists gtk4 libadwaita-1 vte-2.91-gtk4 2>/dev/null; then
+      say "build dependencies already installed"
+    elif ! can_sudo; then
+      die "installing build dependencies needs sudo; run this in a terminal"
+    elif have apt-get; then
       say "installing build dependencies (sudo)"
       sudo_ apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
     elif have dnf; then sudo_ dnf install -y gcc pkgconf-pkg-config gtk4-devel libadwaita-devel vte291-gtk4-devel
@@ -120,25 +141,36 @@ install_macos() {
 }
 
 # ---------- Linux ----------
-install_linux() {
-  [ "$ARCH" = "x86_64" ] || return 1
-  if [ "${CC_DECK_FORMAT:-}" != "tar" ] && have apt-get && have dpkg; then
-    say "downloading the .deb"
-    fetch "$(url cc-deck_amd64.deb)" "$TMP/cc-deck_amd64.deb" || return 1
-    say "installing with apt (sudo): GTK 4, libadwaita and VTE come along"
-    sudo_ apt-get install -y "$TMP/cc-deck_amd64.deb" || return 1
-    link_cli /usr/bin/claude-deck
-  else
-    say "downloading the tarball"
-    fetch "$(url cc-deck-linux-x86_64.tar.gz)" "$TMP/cc.tgz" || return 1
-    tar -C "$TMP" -xzf "$TMP/cc.tgz"
-    mkdir -p "$HOME/.local"
-    cp -R "$TMP/cc-deck/." "$HOME/.local/"
-    sed -i "s|^Exec=.*|Exec=$HOME/.local/bin/cc-deck|" "$HOME/.local/share/applications/dev.claudedeck.CCDeck.desktop" 2>/dev/null || true
-    warn "needs GTK >= 4.14, libadwaita >= 1.5 and VTE (GTK 4) >= 0.76 from your distribution"
-  fi
+install_tarball() {
+  say "downloading the tarball"
+  fetch "$(url cc-deck-linux-x86_64.tar.gz)" "$TMP/cc.tgz" || return 2
+  tar -C "$TMP" -xzf "$TMP/cc.tgz"
+  mkdir -p "$HOME/.local"
+  cp -R "$TMP/cc-deck/." "$HOME/.local/"
+  sed -i "s|^Exec=.*|Exec=$HOME/.local/bin/cc-deck|" "$HOME/.local/share/applications/dev.claudedeck.CCDeck.desktop" 2>/dev/null || true
   have update-desktop-database && update-desktop-database -q "$HOME/.local/share/applications" 2>/dev/null || true
-  say "installed CC Deck (open it from your app menu or run cc-deck)"
+  linux_runtime_ok || warn "install GTK >= 4.14, libadwaita >= 1.5 and VTE (GTK 4) >= 0.76 from your distribution (Ubuntu: sudo apt install libgtk-4-1 libadwaita-1-0 libvte-2.91-gtk4-0)"
+  say "installed CC Deck into ~/.local (open it from your app menu or run cc-deck)"
+}
+
+install_linux() {
+  [ "$ARCH" = "x86_64" ] || return 2
+  if [ "${CC_DECK_FORMAT:-}" != "tar" ] && have apt-get && have dpkg; then
+    if can_sudo; then
+      say "downloading the .deb"
+      fetch "$(url cc-deck_amd64.deb)" "$TMP/cc-deck_amd64.deb" || return 2
+      say "installing with apt (sudo): GTK 4, libadwaita and VTE come along"
+      if sudo_ apt-get install -y "$TMP/cc-deck_amd64.deb"; then
+        link_cli /usr/bin/claude-deck
+        say "installed CC Deck (open it from your app menu or run cc-deck)"
+        return 0
+      fi
+      warn "apt couldn't install the .deb; installing the tarball into ~/.local instead"
+    else
+      warn "sudo can't ask for a password here; installing into ~/.local without sudo (run in a terminal for the .deb)"
+    fi
+  fi
+  install_tarball
 }
 
 if [ "$SOURCE" = "1" ]; then
@@ -146,7 +178,9 @@ if [ "$SOURCE" = "1" ]; then
 elif [ "$OS" = "Darwin" ]; then
   install_macos || { warn "no release download available; building from source"; from_source; }
 elif [ "$OS" = "Linux" ]; then
-  install_linux || { warn "no release download for this system; building from source"; from_source; }
+  rc=0; install_linux || rc=$?
+  [ "$rc" = "2" ] && { warn "no release download for this system; building from source"; from_source; }
+  [ "$rc" = "0" ] || [ "$rc" = "2" ] || exit "$rc"
 else
   die "unsupported system: $OS"
 fi
