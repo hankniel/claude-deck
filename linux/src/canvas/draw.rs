@@ -21,37 +21,60 @@ pub struct Theme {
     pub dark: bool,
 }
 
+/// Diagram colours, derived from the workbench theme.
 pub fn theme() -> Theme {
-    if is_dark() {
-        Theme {
-            bg: hex(0x1E1E1E),
-            fg: hex(0xE8E6E3),
-            muted: hex(0x9A968F),
-            card: hex(0x2A2A2A),
-            card_alt: hex(0x252525),
-            border: hex(0x47443F),
-            edge: hex(0x77736C),
-            accent: hex(0xD97757),
-            blue: hex(0x4C9AE8),
-            blue_tint: hex(0x1D3247),
-            group: hex(0x262626),
-            dark: true,
-        }
+    let dark = is_dark();
+    let p = crate::theme::palette(dark);
+    let (bg, fg, strong) = (hex(p.editor), hex(p.fg), hex(p.strong));
+    let blue = hex(p.term[if dark { 12 } else { 4 }]);
+    Theme {
+        bg,
+        fg: mix(fg, strong, 0.4),
+        muted: hex(p.dim),
+        card: if dark { mix(bg, strong, 0.07) } else { mix(bg, (1.0, 1.0, 1.0), 0.85) },
+        card_alt: if dark { mix(bg, strong, 0.11) } else { mix(bg, fg, 0.04) },
+        border: mix(bg, fg, if dark { 0.20 } else { 0.16 }),
+        edge: mix(bg, fg, if dark { 0.45 } else { 0.42 }),
+        accent: hex(p.accent),
+        blue,
+        blue_tint: mix(bg, blue, if dark { 0.16 } else { 0.10 }),
+        group: mix(bg, hex(p.chrome), 0.6),
+        dark,
+    }
+}
+
+/// Soft layered shadow under a rounded card.
+pub fn shadow(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64, dark: bool) {
+    let base = if dark { 0.20 } else { 0.035 };
+    for (i, (dy, grow)) in [(1.0, 0.0), (2.0, 1.5), (4.0, 3.5), (7.0, 6.0)].iter().enumerate() {
+        set(cr, (0.0, 0.0, 0.0), base / (1.0 + i as f64 * 0.9));
+        rounded(cr, x - grow, y + dy - grow * 0.4, w + grow * 2.0, h + grow * 1.2, r + grow);
+        let _ = cr.fill();
+    }
+}
+
+/// A pill with a hairline border (edge labels, counts).
+pub fn badge(cr: &cairo::Context, w: &impl IsA<gtk::Widget>, s: &str, cx: f64, cy: f64, f: Font, fg: Rgb, bg: Rgb, border: Rgb) {
+    let (tw, th) = measure(w, s, f);
+    let (pw, ph) = (tw + 14.0, th + 6.0);
+    set(cr, bg, 1.0);
+    rounded(cr, cx - pw / 2.0, cy - ph / 2.0, pw, ph, ph / 2.0);
+    let _ = cr.fill_preserve();
+    set(cr, border, 1.0);
+    cr.set_line_width(1.0);
+    let _ = cr.stroke();
+    text_centered(cr, w, s, cx, cy, f, fg, 1.0);
+}
+
+/// Cubic curve between two ports whose tangents follow the flow axis.
+pub fn port_curve(cr: &cairo::Context, a: (f64, f64), b: (f64, f64), horizontal: bool) {
+    cr.move_to(a.0, a.1);
+    if horizontal {
+        let d = ((b.0 - a.0).abs() * 0.5).max(28.0) * if b.0 >= a.0 { 1.0 } else { -1.0 };
+        cr.curve_to(a.0 + d, a.1, b.0 - d, b.1, b.0, b.1);
     } else {
-        Theme {
-            bg: hex(0xFBFAF8),
-            fg: hex(0x1F1E1D),
-            muted: hex(0x6F6B66),
-            card: hex(0xFFFFFF),
-            card_alt: hex(0xF6F5F2),
-            border: hex(0xD9D6D0),
-            edge: hex(0x9C978F),
-            accent: hex(0xC4603F),
-            blue: hex(0x2272B4),
-            blue_tint: hex(0xE8F1FA),
-            group: hex(0xF3F1ED),
-            dark: false,
-        }
+        let d = ((b.1 - a.1).abs() * 0.5).max(24.0) * if b.1 >= a.1 { 1.0 } else { -1.0 };
+        cr.curve_to(a.0, a.1 + d, b.0, b.1 - d, b.0, b.1);
     }
 }
 
@@ -131,6 +154,15 @@ pub const MONO: Font = Font { scale: 0.88, bold: false, mono: true };
 pub fn layout(w: &impl IsA<gtk::Widget>, s: &str, f: Font) -> pango::Layout {
     let l = w.as_ref().create_pango_layout(Some(s));
     let mut fd = w.as_ref().pango_context().font_description().unwrap_or_default();
+    if let Some(custom) = crate::theme::font("diagram") {
+        let c = pango::FontDescription::from_string(&custom);
+        if let Some(fam) = c.family() {
+            fd.set_family(&fam);
+        }
+        if c.size() > 0 {
+            fd.set_size(c.size());
+        }
+    }
     if f.mono {
         fd.set_family("Monospace");
     }
@@ -182,19 +214,6 @@ pub fn arrow_head(cr: &cairo::Context, tip: (f64, f64), from: (f64, f64), size: 
     let _ = cr.fill();
 }
 
-/// Where the segment from the rect's centre toward `p` leaves the rect.
-pub fn boundary(r: &claude_deck::canvas::layout::Rect, p: (f64, f64)) -> (f64, f64) {
-    let (cx, cy) = (r.cx(), r.cy());
-    let (dx, dy) = (p.0 - cx, p.1 - cy);
-    if dx.abs() < 1e-9 && dy.abs() < 1e-9 {
-        return (cx, cy);
-    }
-    let sx = if dx.abs() > 1e-9 { (r.w / 2.0) / dx.abs() } else { f64::INFINITY };
-    let sy = if dy.abs() > 1e-9 { (r.h / 2.0) / dy.abs() } else { f64::INFINITY };
-    let s = sx.min(sy);
-    (cx + dx * s, cy + dy * s)
-}
-
 /// A smooth curve through points (Catmull-Rom as cubic Béziers).
 pub fn smooth_path(cr: &cairo::Context, pts: &[(f64, f64)]) {
     if pts.len() < 2 {
@@ -236,13 +255,4 @@ pub fn s_curve_dist(a: (f64, f64), b: (f64, f64), out_dir: f64, in_dir: f64, p: 
         best = best.min(((x - p.0).powi(2) + (y - p.1).powi(2)).sqrt());
     }
     best
-}
-
-pub fn pill(cr: &cairo::Context, w: &impl IsA<gtk::Widget>, s: &str, cx: f64, cy: f64, f: Font, fg: Rgb, bg: Rgb) {
-    let (tw, th) = measure(w, s, f);
-    let (pw, ph) = (tw + 10.0, th + 2.0);
-    set(cr, bg, 0.95);
-    rounded(cr, cx - pw / 2.0, cy - ph / 2.0, pw, ph, ph / 2.0);
-    let _ = cr.fill();
-    text_centered(cr, w, s, cx, cy, f, fg, 1.0);
 }

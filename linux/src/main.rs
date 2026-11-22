@@ -9,6 +9,7 @@ mod canvas;
 mod control;
 mod dashboard;
 mod deck;
+mod files;
 mod jira;
 mod model;
 mod picker;
@@ -16,7 +17,9 @@ mod prefs;
 mod settings;
 mod shell;
 mod term;
+mod theme;
 mod widgets;
+mod workbench;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -36,7 +39,12 @@ fn main() -> glib::ExitCode {
 
     let app = adw::Application::builder()
         .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::empty())
+        .flags(if std::env::var_os("CC_DECK_SNAPSHOT").is_some() {
+            // a snapshot run must not hand over to an already open CC Deck
+            gio::ApplicationFlags::NON_UNIQUE
+        } else {
+            gio::ApplicationFlags::empty()
+        })
         .build();
 
     app.connect_startup(|app| {
@@ -96,7 +104,7 @@ const SHORTCUTS_UI: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <property name="title">Terminals</property>
             <child><object class="GtkShortcutsShortcut"><property name="title">New terminal</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;t</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">New terminal in home folder</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;t</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="title">Close terminal</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;w</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Close tab</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;w</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Next / previous terminal</property><property name="accelerator">&lt;Ctrl&gt;Page_Down &lt;Ctrl&gt;Page_Up</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Go to terminal 1–9</property><property name="accelerator">&lt;Alt&gt;1...9</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Copy / paste</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;c &lt;Ctrl&gt;&lt;Shift&gt;v</property></object></child>
@@ -109,15 +117,23 @@ const SHORTCUTS_UI: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <property name="title">Claude</property>
             <child><object class="GtkShortcutsShortcut"><property name="title">Start Claude in this terminal</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;k</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Refresh usage</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;r</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="title">Dashboard</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;d</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="title">Canvas</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;e</property></object></child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Layout</property>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Show or hide the panel</property><property name="accelerator">&lt;Ctrl&gt;grave</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Show or hide the side bar</property><property name="accelerator">F9 &lt;Ctrl&gt;&lt;Shift&gt;b</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Explorer</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;e</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Go to an open tab</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;p</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Board</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;o</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Jira</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;j</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Dashboard</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;d</property></object></child>
           </object>
         </child>
         <child>
           <object class="GtkShortcutsGroup">
             <property name="title">Window</property>
-            <child><object class="GtkShortcutsShortcut"><property name="title">Toggle sidebar</property><property name="accelerator">F9</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Settings</property><property name="accelerator">&lt;Ctrl&gt;comma</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Keyboard shortcuts</property><property name="accelerator">&lt;Ctrl&gt;question</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Quit</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;q</property></object></child>
@@ -141,6 +157,7 @@ fn snapshot_if_requested(d: &Rc<deck::Deck>) {
             "settings" => settings::Settings::show(&d, None),
             "picker" => d.debug_pick(),
             "board" => d.select(deck::Sel::Board),
+            m if m.starts_with("layout:") => d.debug_layout(&m[7..]),
             "jira" => d.select(deck::Sel::Jira),
             m if m.starts_with("changes:") => {
                 d.select(deck::Sel::Canvas);
@@ -173,7 +190,11 @@ fn snapshot_if_requested(d: &Rc<deck::Deck>) {
             paintable.snapshot(&snap, width as f64, height as f64);
             if let (Some(node), Some(native)) = (snap.to_node(), w.native()) {
                 let tex = native.renderer().unwrap().render_texture(&node, None);
-                let _ = tex.save_to_png(&out);
+                if let Err(e) = tex.save_to_png(&out) {
+                    eprintln!("snapshot: {e}");
+                }
+            } else {
+                eprintln!("snapshot: nothing rendered ({width}x{height})");
             }
             d.shutdown();
             d.app.quit();

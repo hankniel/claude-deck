@@ -58,19 +58,48 @@ In plain terminals, `claude-deck launch` gives the same account choice as a text
 ## Desktop app (CC Deck, Linux)
 
 `linux/` is the same app for GNOME/GTK desktops (GTK 4 + libadwaita + VTE), built on the
-shared Rust core: terminal tabs with the account picker on `claude`, the account menu that
-moves a running conversation, sidebar usage rings, limit banner and auto-switch, desktop
-notifications, settings (accounts, folder defaults, limit lines) and the dashboard.
+shared Rust core and laid out like VS Code:
+
+- **Activity bar**: Explorer, Accounts, Board, Jira, Dashboard; the gear holds settings and new
+  sessions. The Board icon counts agent sessions waiting for you.
+- **Explorer**: Terminals (shells and Claude sessions), Canvas (agent sessions and their screens)
+  and Files (the active terminal's folder; files open as read-only tabs, the eye shows hidden ones).
+- **Editor area**: canvas screens, files, Git changes, Board, Jira and the Dashboard open as tabs,
+  with a breadcrumb. Split it into two groups from a tab's menu or by dragging a tab.
+- **Panel**: terminals and Claude sessions, docked bottom, right, left or top (layout button in
+  the title bar), split in two, maximized or hidden. Any tab moves between panel and editor area
+  by drag and drop or its menu, so a Claude chat can sit beside its diagram.
+- **Status bar**: Git branch (opens its changes), sessions waiting for you, the Claude account of
+  the active terminal with its 5-hour / 7-day usage (click to move the conversation), auto-switch.
+- **Title bar**: what is open, plus Ctrl+Shift+P to jump to any open tab, terminal or page.
+
+Canvas flowcharts are drawn as Databricks-style cards: an icon tile showing the node's Mermaid
+shape, the first label line as the title and the rest as a subtitle, edges as curves between
+port dots with their labels as badges. Clicking a node traces its lineage and fades the rest;
+folding a group animates the layout. Diagrams open at a readable zoom (85–100%) and re-fit when
+the view resizes until you pan or zoom.
+
+Settings → General → **Theme** picks Claude (warm), VS Code Modern, Nord, Solarized, GitHub or
+Catppuccin, each in light and dark (Appearance: System, Light, Dark); terminals and diagrams
+follow it. **Background** puts an image behind the editor area and diagrams with an adjustable
+strength; **Fonts** sets the interface, terminal and diagram fonts. The layout (side bar, panel
+position and size) is remembered.
+
 Needs GTK ≥ 4.14, libadwaita ≥ 1.5, VTE ≥ 0.76 (Ubuntu 24.04 or newer).
 
 ```bash
 ./linux/build.sh --deps --install   # apt build deps (sudo), then ~/.local/bin + app menu entry
 ```
 
-Shortcuts follow Linux terminals: Ctrl+Shift+T/W new/close tab, Ctrl+Shift+K start Claude,
-Ctrl+Shift+C/V copy/paste, Alt+1–9 tabs, Ctrl+Shift+D dashboard, F9 sidebar, Ctrl+? all.
-`CC_DECK_SNAPSHOT=out.png CC_DECK_SNAPSHOT_MODE=dashboard|settings|picker cc-deck` renders the
-window to a PNG and quits (development aid).
+Shortcuts: Ctrl+Shift+T new terminal, Ctrl+Shift+K start Claude, Ctrl+Shift+W close tab,
+Ctrl+` panel, Ctrl+Shift+B or F9 side bar, Ctrl+Shift+E explorer, Ctrl+Shift+P go to tab,
+Ctrl+Shift+O board, Ctrl+Shift+J Jira, Ctrl+Shift+D dashboard, Ctrl+Shift+C/V copy/paste,
+Alt+1–9 terminals, Ctrl+, settings, Ctrl+? all.
+
+Development aid: `CC_DECK_SNAPSHOT=out.png cc-deck` renders the window to a PNG and quits, in a
+separate instance. `CC_DECK_SNAPSHOT_MODE` picks what to show: `dashboard`, `settings`, `picker`,
+`board`, `jira`, `canvas:<session>/<screen>`, `changes:<dir>`, or `layout:<bottom|right|left|top>`
+(add `+split` for split groups). On Wayland, set `GDK_BACKEND=x11` for snapshots.
 
 ## Canvas and board
 

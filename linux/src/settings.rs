@@ -75,7 +75,115 @@ impl Settings {
             prefs::apply_appearance(a);
         });
         win_group.add(&appearance);
+        let names: Vec<&str> = crate::theme::PRESETS.iter().map(|p| p.name).collect();
+        let theme = adw::ComboRow::builder()
+            .title("Theme")
+            .subtitle("Colours of the window, terminals and diagrams, in light and dark")
+            .model(&gtk::StringList::new(&names))
+            .build();
+        theme.set_selected(crate::theme::preset_index() as u32);
+        theme.connect_selected_notify(|r| {
+            if let Some(p) = crate::theme::PRESETS.get(r.selected() as usize) {
+                crate::theme::set_preset(p.id);
+            }
+        });
+        win_group.add(&theme);
         general.add(&win_group);
+
+        // background image behind the editor area and diagrams
+        let bg_group = adw::PreferencesGroup::builder()
+            .title("Background")
+            .description("An image behind the editor area and diagrams. Cards, side bar, panel and terminals stay solid.")
+            .build();
+        let image = adw::ActionRow::builder().title("Image").build();
+        let image_name = |p: Option<String>| {
+            p.and_then(|p| std::path::Path::new(&p).file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| "None".into())
+        };
+        image.set_subtitle(&image_name(crate::theme::bg_image()));
+        let choose = gtk::Button::with_label("Choose…");
+        choose.set_valign(gtk::Align::Center);
+        let clear = gtk::Button::from_icon_name("edit-clear-symbolic");
+        clear.set_valign(gtk::Align::Center);
+        clear.add_css_class("flat");
+        clear.set_tooltip_text(Some("No image"));
+        image.add_suffix(&choose);
+        image.add_suffix(&clear);
+        let strength = adw::SpinRow::with_range(5.0, 60.0, 5.0);
+        strength.set_title("Image strength");
+        strength.set_subtitle("Percent of the image that shows through");
+        strength.set_value((crate::theme::bg_strength() * 100.0).round());
+        strength.connect_value_notify(|r| crate::theme::set_bg_strength(r.value() / 100.0));
+        let row = image.clone();
+        clear.connect_clicked(move |_| {
+            crate::theme::set_bg_image(None);
+            row.set_subtitle("None");
+        });
+        let row = image.clone();
+        let win = deck.window.clone();
+        choose.connect_clicked(move |_| {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Images"));
+            filter.add_mime_type("image/*");
+            let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+            let fd = gtk::FileDialog::builder().title("Background image").filters(&filters).modal(true).build();
+            let row = row.clone();
+            fd.open(Some(&win), None::<&gtk::gio::Cancellable>, move |res| {
+                if let Some(path) = res.ok().and_then(|f| f.path()) {
+                    let p = path.to_string_lossy().to_string();
+                    crate::theme::set_bg_image(Some(&p));
+                    row.set_subtitle(&path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(p));
+                }
+            });
+        });
+        bg_group.add(&image);
+        bg_group.add(&strength);
+        general.add(&bg_group);
+
+        // fonts
+        let fonts = adw::PreferencesGroup::builder().title("Fonts").build();
+        for (kind, title, sub, mono) in [
+            ("ui", "Interface", "Menus, tabs, side bar and pages", false),
+            ("mono", "Terminal", "Shells and Claude sessions", true),
+            ("diagram", "Diagrams", "Canvas screens (applies to screens opened after the change)", false),
+        ] {
+            let row = adw::ActionRow::builder().title(title).subtitle(sub).build();
+            let dialog = gtk::FontDialog::builder().title(title).modal(true).build();
+            let btn = gtk::FontDialogButton::new(Some(dialog));
+            btn.set_valign(gtk::Align::Center);
+            let current = crate::theme::font(kind).or_else(|| {
+                if mono {
+                    Some(crate::theme::mono_font().to_string())
+                } else {
+                    gtk::Settings::default().and_then(|s| s.gtk_font_name()).map(|f| f.to_string())
+                }
+            });
+            if let Some(c) = current {
+                btn.set_font_desc(&gtk::pango::FontDescription::from_string(&c));
+            }
+            if mono {
+                if let Some(dlg) = btn.dialog() {
+                    dlg.set_filter(Some(&gtk::CustomFilter::new(|o| {
+                        o.downcast_ref::<gtk::pango::FontFamily>().is_none_or(|f| f.is_monospace())
+                    })));
+                }
+            }
+            btn.connect_font_desc_notify(move |b| {
+                if let Some(fd) = b.font_desc() {
+                    crate::theme::set_font(kind, Some(&fd.to_string()));
+                }
+            });
+            let reset = gtk::Button::from_icon_name("edit-undo-symbolic");
+            reset.set_valign(gtk::Align::Center);
+            reset.add_css_class("flat");
+            reset.set_tooltip_text(Some("Default font"));
+            reset.connect_clicked(move |_| crate::theme::set_font(kind, None));
+            row.add_suffix(&btn);
+            row.add_suffix(&reset);
+            fonts.add(&row);
+        }
+        general.add(&fonts);
 
         let auto_group = adw::PreferencesGroup::builder().title("Auto-switch").build();
         let auto_row = adw::SwitchRow::builder()

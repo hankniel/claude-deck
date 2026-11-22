@@ -32,6 +32,16 @@ pub trait Model: 'static {
     }
     fn drag(&mut self, _dx: f64, _dy: f64) {}
     fn release(&mut self) {}
+    /// True while the model has a transition running (the view keeps redrawing).
+    fn animating(&self) -> bool {
+        false
+    }
+}
+
+/// Ease-out cubic over `ms` since `start`: 0 → 1.
+pub fn ease(start: std::time::Instant, ms: f64) -> f64 {
+    let t = (start.elapsed().as_secs_f64() * 1000.0 / ms).clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
 }
 
 struct St {
@@ -49,6 +59,14 @@ struct St {
     min_fit: Cell<f64>,
     /// Where to centre after a fit when the whole content doesn't fit.
     anchor: Cell<Option<(f64, f64)>>,
+    /// The user panned or zoomed: resizes no longer re-fit.
+    touched: Cell<bool>,
+    /// View size at the last fit.
+    fit_size: Cell<(i32, i32)>,
+    /// A frame clock callback is running (camera or model transition).
+    ticking: Cell<bool>,
+    /// Camera transition: from (scale, ox, oy) to target, started at.
+    cam: Cell<Option<((f64, f64, f64), (f64, f64, f64), std::time::Instant)>>,
 }
 
 pub struct Diagram<M: Model> {
@@ -111,15 +129,33 @@ impl<M: Model> Diagram<M> {
                 pinch_scale: Cell::new(1.0),
                 min_fit: Cell::new(0.15),
                 anchor: Cell::new(None),
+                touched: Cell::new(false),
+                fit_size: Cell::new((0, 0)),
+                ticking: Cell::new(false),
+                cam: Cell::new(None),
             }),
         });
 
+        let weak_area = d.area.downgrade();
+        crate::theme::watch(move || match weak_area.upgrade() {
+            Some(a) => {
+                a.queue_draw();
+                true
+            }
+            None => false,
+        });
         let (m, st) = (d.model.clone(), d.st.clone());
         let me = Rc::downgrade(&d);
         d.area.set_draw_func(move |a, cr, w, h| {
             let t = draw::theme();
-            set(cr, t.bg, 1.0);
-            let _ = cr.paint();
+            if !crate::theme::bg_active() {
+                set(cr, t.bg, 1.0);
+                let _ = cr.paint();
+            }
+            // a view that was resized before the user moved it fits again
+            if st.fitted.get() && !st.touched.get() && st.cam.get().is_none() && st.fit_size.get() != (w, h) {
+                st.fitted.set(false);
+            }
             if !st.fitted.get() && w > 0 && h > 0 {
                 if let Some(me) = me.upgrade() {
                     me.fit_to(w as f64, h as f64);
@@ -129,7 +165,7 @@ impl<M: Model> Diagram<M> {
             // dot grid
             let step = 22.0 * s;
             if step > 6.0 {
-                set(cr, t.fg, if t.dark { 0.07 } else { 0.09 });
+                set(cr, t.fg, if t.dark { 0.10 } else { 0.13 });
                 let (ox, oy) = (st.ox.get().rem_euclid(step), st.oy.get().rem_euclid(step));
                 let mut y = oy;
                 while y < h as f64 {
@@ -172,6 +208,8 @@ impl<M: Model> Diagram<M> {
                 m.borrow_mut().drag((dx - lx) / s, (dy - ly) / s);
                 st.last.set((dx, dy));
             } else {
+                st.cam.set(None);
+                st.touched.set(true);
                 let (sx, sy) = st.start.get();
                 st.ox.set(sx + dx);
                 st.oy.set(sy + dy);
@@ -190,6 +228,7 @@ impl<M: Model> Diagram<M> {
 
         let click = gtk::GestureClick::new();
         click.set_button(1);
+        let me_click = Rc::downgrade(&d);
         let (m, st, a) = (d.model.clone(), d.st.clone(), d.area.clone());
         let to_c = Self::to_content_fn(&d.st);
         click.connect_released(move |g, n, x, y| {
@@ -200,7 +239,12 @@ impl<M: Model> Diagram<M> {
             let r = m.borrow_mut().click(to_c(x, y), n, mods);
             match r {
                 Reaction::None => {}
-                Reaction::Redraw => a.queue_draw(),
+                Reaction::Redraw => {
+                    a.queue_draw();
+                    if let Some(me) = me_click.upgrade() {
+                        me.kick();
+                    }
+                }
                 Reaction::Open(p, l) => on_open(p, l),
             }
         });
@@ -245,6 +289,7 @@ impl<M: Model> Diagram<M> {
                 me.zoom_at(f, x, y);
             } else {
                 let k = if px { 1.0 } else { 40.0 };
+                me.st.touched.set(true);
                 me.st.ox.set(me.st.ox.get() - dx * k);
                 me.st.oy.set(me.st.oy.get() - dy * k);
                 me.area.queue_draw();
@@ -299,41 +344,95 @@ impl<M: Model> Diagram<M> {
         }
     }
 
-    fn fit_to(&self, w: f64, h: f64) {
+    /// The camera (scale, ox, oy) that fits the content into w × h.
+    fn fit_target(&self, w: f64, h: f64) -> (f64, f64, f64) {
         let (cw, ch) = self.model.borrow().size();
         let (cw, ch) = (cw.max(1.0), ch.max(1.0));
         let fit = ((w - 60.0) / cw).min((h - 80.0) / ch);
-        let s = fit.clamp(self.st.min_fit.get().min(1.0), 1.4);
-        self.st.scale.set(s);
+        let s = fit.clamp(self.st.min_fit.get().min(1.0), 1.0);
         if s > fit + 1e-6 {
             // doesn't fit at a readable size: start at the anchor (or the left middle)
             let (ax, ay) = self.st.anchor.get().unwrap_or(((w / 2.0 - 30.0) / s, ch / 2.0));
-            self.st.ox.set(w / 2.0 - ax * s);
-            self.st.oy.set(h / 2.0 - ay * s);
+            (s, w / 2.0 - ax * s, h / 2.0 - ay * s)
         } else {
-            self.st.ox.set((w - cw * s) / 2.0);
-            self.st.oy.set(((h - ch * s) / 2.0).max(16.0));
+            (s, (w - cw * s) / 2.0, ((h - ch * s) / 2.0).max(16.0))
         }
+    }
+
+    fn fit_to(&self, w: f64, h: f64) {
+        self.st.fit_size.set((w as i32, h as i32));
+        let (s, ox, oy) = self.fit_target(w, h);
+        self.st.scale.set(s);
+        self.st.ox.set(ox);
+        self.st.oy.set(oy);
         self.st.fitted.set(true);
+    }
+
+    /// Move the camera smoothly.
+    fn glide(&self, to: (f64, f64, f64)) {
+        let from = (self.st.scale.get(), self.st.ox.get(), self.st.oy.get());
+        self.st.cam.set(Some((from, to, std::time::Instant::now())));
+        self.kick();
+    }
+
+    /// Redraw on every frame while the camera or the model is in transition.
+    pub fn kick(&self) {
+        self.area.queue_draw();
+        if self.st.ticking.get() {
+            return;
+        }
+        self.st.ticking.set(true);
+        let (st, m) = (self.st.clone(), self.model.clone());
+        self.area.add_tick_callback(move |a, _| {
+            let mut busy = m.borrow().animating();
+            if let Some((from, to, at)) = st.cam.get() {
+                let k = ease(at, 240.0);
+                let lerp = |x: f64, y: f64| x + (y - x) * k;
+                st.scale.set(lerp(from.0, to.0));
+                st.ox.set(lerp(from.1, to.1));
+                st.oy.set(lerp(from.2, to.2));
+                if k >= 1.0 {
+                    st.cam.set(None);
+                } else {
+                    busy = true;
+                }
+            }
+            a.queue_draw();
+            if busy {
+                glib::ControlFlow::Continue
+            } else {
+                st.ticking.set(false);
+                glib::ControlFlow::Break
+            }
+        });
     }
 
     pub fn fit(&self) {
         let (w, h) = (self.area.width() as f64, self.area.height() as f64);
         if w > 0.0 && h > 0.0 {
-            self.fit_to(w, h);
+            self.st.fitted.set(true);
+            self.st.touched.set(false);
+            self.st.fit_size.set((w as i32, h as i32));
+            self.glide(self.fit_target(w, h));
         } else {
             self.st.fitted.set(false);
+            self.area.queue_draw();
         }
-        self.area.queue_draw();
     }
 
-    /// Fit again on the next draw (after the content changed a lot).
+    /// Fit again (smoothly) after the content changed a lot.
     pub fn refit(&self) {
-        self.st.fitted.set(false);
-        self.area.queue_draw();
+        if self.area.width() > 0 && self.st.fitted.get() {
+            self.fit();
+        } else {
+            self.st.fitted.set(false);
+            self.kick();
+        }
     }
 
     fn zoom_at(&self, f: f64, x: f64, y: f64) {
+        self.st.cam.set(None);
+        self.st.touched.set(true);
         let s0 = self.st.scale.get();
         let s1 = (s0 * f).clamp(0.08, 4.0);
         let k = s1 / s0;
@@ -343,16 +442,21 @@ impl<M: Model> Diagram<M> {
         self.area.queue_draw();
     }
 
+    /// Zoom buttons: an eased zoom about the middle of the view.
     fn zoom_center(&self, f: f64) {
-        self.zoom_at(f, self.area.width() as f64 / 2.0, self.area.height() as f64 / 2.0);
+        self.st.touched.set(true);
+        let (x, y) = (self.area.width() as f64 / 2.0, self.area.height() as f64 / 2.0);
+        let s0 = self.st.scale.get();
+        let s1 = (s0 * f).clamp(0.08, 4.0);
+        let k = s1 / s0;
+        self.glide((s1, x - (x - self.st.ox.get()) * k, y - (y - self.st.oy.get()) * k));
     }
 
-    /// Bring a content point to the middle of the view.
+    /// Bring a content point to the middle of the view, smoothly.
     pub fn center_on(&self, x: f64, y: f64) {
+        self.st.touched.set(true);
         let s = self.st.scale.get();
-        self.st.ox.set(self.area.width() as f64 / 2.0 - x * s);
-        self.st.oy.set(self.area.height() as f64 / 2.0 - y * s);
-        self.area.queue_draw();
+        self.glide((s, self.area.width() as f64 / 2.0 - x * s, self.area.height() as f64 / 2.0 - y * s));
     }
 
     /// Fits never zoom out below `min`; the view then starts centred on `anchor`.
@@ -362,7 +466,7 @@ impl<M: Model> Diagram<M> {
     }
 
     pub fn redraw(&self) {
-        self.area.queue_draw();
+        self.kick();
     }
 
     pub fn widget(&self) -> gtk::Widget {

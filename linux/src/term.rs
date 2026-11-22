@@ -40,34 +40,18 @@ fn rgba(h: u32) -> gdk::RGBA {
     gdk::RGBA::new(r as f32, g as f32, b as f32, 1.0)
 }
 
-pub fn apply_theme(term: &vte::Terminal, dark: bool) {
-    let (fg, bg, pal, sel) = if dark {
-        (
-            0xE6E6E3,
-            0x1E1E1E,
-            [
-                0x3A3A38, 0xF0745F, 0x7CC27E, 0xE6BE5A, 0x6FA4E8, 0xC795E0, 0x63C3C0, 0xD4D4D0, 0x7A7A76, 0xFF8D78,
-                0x96D497, 0xF2CF76, 0x8DB9F0, 0xD8AEEB, 0x82D4D1, 0xF5F5F2,
-            ],
-            gdk::RGBA::new(0.85, 0.47, 0.34, 0.35),
-        )
-    } else {
-        (
-            0x1D1D1F,
-            0xFFFFFF,
-            [
-                0x1D1D1F, 0xC0392B, 0x2E7D32, 0x9A6700, 0x2563B8, 0x8E44AD, 0x16808A, 0xBDBDB8, 0x6E6E73, 0xD9534F,
-                0x3C9A40, 0xB07D12, 0x3B7DD8, 0xA35CC2, 0x1F99A3, 0x8E8E93,
-            ],
-            gdk::RGBA::new(0.79, 0.39, 0.26, 0.22),
-        )
-    };
-    let palette: Vec<gdk::RGBA> = pal.iter().map(|h| rgba(*h)).collect();
+/// Terminal colours from the theme; the background matches the group it sits in.
+pub fn apply_theme(term: &vte::Terminal, dark: bool, in_panel: bool) {
+    let p = crate::theme::palette(dark);
+    let bg = if in_panel { p.chrome } else { p.editor };
+    let palette: Vec<gdk::RGBA> = p.term.iter().map(|h| rgba(*h)).collect();
     let refs: Vec<&gdk::RGBA> = palette.iter().collect();
-    term.set_colors(Some(&rgba(fg)), Some(&rgba(bg)), &refs);
-    term.set_color_cursor(Some(&rgba(0xCC6B4A)));
-    term.set_color_highlight(Some(&sel));
+    term.set_colors(Some(&rgba(p.fg)), Some(&rgba(bg)), &refs);
+    term.set_color_cursor(Some(&rgba(p.accent)));
+    let (r, g, b) = crate::widgets::hex(p.accent);
+    term.set_color_highlight(Some(&gdk::RGBA::new(r as f32, g as f32, b as f32, if dark { 0.35 } else { 0.24 })));
     term.set_color_highlight_foreground(None);
+    term.set_font(Some(&crate::theme::mono_font()));
 }
 
 const URL_RE: &str = r#"(https?|file)://[^\s<>"'`]+[^\s<>"'`.,;:!?)\]]"#;
@@ -78,6 +62,7 @@ impl Tab {
         let id = uuid::Uuid::new_v4().to_string();
         let term = vte::Terminal::new();
         term.set_scrollback_lines(10_000);
+        term.set_cell_height_scale(1.08);
         term.set_mouse_autohide(true);
         term.set_bold_is_bright(false);
         term.set_allow_hyperlink(true);
@@ -87,7 +72,7 @@ impl Tab {
             let tag = term.match_add_regex(&re, 0);
             term.match_set_cursor_name(tag, "pointer");
         }
-        apply_theme(&term, crate::widgets::is_dark());
+        apply_theme(&term, crate::widgets::is_dark(), true);
 
         let page = gtk::ScrolledWindow::new();
         page.set_hscrollbar_policy(gtk::PolicyType::Never);

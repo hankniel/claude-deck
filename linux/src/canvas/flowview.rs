@@ -1,11 +1,12 @@
 //! Interactive flowchart: collapsible groups, lineage highlight on click, search, links.
 
-use super::draw::{self, set, Font, BODY, SMALL, SMALL_BOLD};
-use super::view::{Model, Reaction};
+use super::draw::{self, set, Font, SMALL, SMALL_BOLD};
+use super::view::{ease, Model, Reaction};
 use claude_deck::canvas::flow::{EdgeKind, Flow, Shape};
 use claude_deck::canvas::layout::{self, LNode, Layout, Opts, Rect};
 use gtk::{cairo, gdk};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use std::f64::consts::PI;
 
 const TITLE_H: f64 = 28.0;
@@ -21,21 +22,116 @@ pub struct FlowModel {
     lit_edges: HashSet<usize>,
     matches: Vec<usize>,
     meas: gtk::Label,
+    /// Layout transition: where each node was drawn when the layout changed.
+    prev: Vec<Option<Rect>>,
+    moved_at: Option<Instant>,
+    /// Fade of everything outside the traced lineage: level from → to since.
+    dim_from: f64,
+    dim_to: f64,
+    dim_at: Option<Instant>,
 }
 
-fn shape_size(shape: Shape, tw: f64, th: f64) -> (f64, f64) {
-    let (w, h) = (tw + 28.0, th + 18.0);
+const MOVE_MS: f64 = 300.0;
+const FADE_MS: f64 = 200.0;
+const DIM: f64 = 0.18;
+
+const TILE: f64 = 30.0;
+const PAD: f64 = 12.0;
+const TEXT_MAX: f64 = 300.0;
+const TITLE_FONT: Font = Font { scale: 0.95, bold: true, mono: false };
+
+/// Card title and subtitle: the first label line, then the rest.
+fn split_label(label: &str) -> (String, String) {
+    let mut lines = label.lines().map(str::trim).filter(|l| !l.is_empty());
+    let title = lines.next().unwrap_or("").to_string();
+    let rest: Vec<&str> = lines.collect();
+    (title, rest.join(" · "))
+}
+
+/// Tint of a node's icon tile: its own fill, else one per Mermaid shape.
+fn kind_color(shape: Shape) -> draw::Rgb {
+    crate::widgets::hex(match shape {
+        Shape::Rect => 0x6E8FB5,
+        Shape::Round | Shape::Stadium => 0xD97757,
+        Shape::Subroutine => 0x8E6CC9,
+        Shape::Cylinder => 0x3E8ED0,
+        Shape::Circle => 0x30A46C,
+        Shape::Diamond => 0xD9A23A,
+        Shape::Hexagon => 0x2A9D8F,
+        Shape::Parallelogram => 0xC75C9A,
+        Shape::Flag => 0xE5484D,
+    })
+}
+
+/// The node's Mermaid shape, drawn small inside its icon tile.
+fn mini_shape(cr: &cairo::Context, shape: Shape, cx: f64, cy: f64, s: f64) {
+    let (x, y, w, h) = (cx - s / 2.0, cy - s * 0.38, s, s * 0.76);
     match shape {
-        Shape::Diamond => ((w * 1.5).max(70.0), (h * 1.6).max(50.0)),
-        Shape::Circle => {
-            let d = w.max(h) + 6.0;
-            (d, d)
+        Shape::Rect | Shape::Subroutine => {
+            draw::rounded(cr, x, y, w, h, 1.5);
+            if shape == Shape::Subroutine {
+                cr.move_to(x + w * 0.2, y);
+                cr.line_to(x + w * 0.2, y + h);
+                cr.move_to(x + w * 0.8, y);
+                cr.line_to(x + w * 0.8, y + h);
+            }
         }
-        Shape::Hexagon => (w + 24.0, h + 4.0),
-        Shape::Cylinder => (w, h + 14.0),
-        Shape::Parallelogram => (w + 22.0, h),
-        Shape::Stadium => (w + 12.0, h),
-        _ => (w.max(64.0), h.max(36.0)),
+        Shape::Round => draw::rounded(cr, x, y, w, h, 4.0),
+        Shape::Stadium => draw::rounded(cr, x, y, w, h, h / 2.0),
+        Shape::Circle => {
+            cr.new_sub_path();
+            cr.arc(cx, cy, s * 0.42, 0.0, 2.0 * PI);
+        }
+        Shape::Diamond => {
+            cr.move_to(cx, cy - s * 0.5);
+            cr.line_to(cx + s * 0.5, cy);
+            cr.line_to(cx, cy + s * 0.5);
+            cr.line_to(cx - s * 0.5, cy);
+            cr.close_path();
+        }
+        Shape::Hexagon => {
+            let k = w * 0.25;
+            cr.move_to(x + k, y);
+            cr.line_to(x + w - k, y);
+            cr.line_to(x + w, cy);
+            cr.line_to(x + w - k, y + h);
+            cr.line_to(x + k, y + h);
+            cr.line_to(x, cy);
+            cr.close_path();
+        }
+        Shape::Parallelogram => {
+            let k = w * 0.25;
+            cr.move_to(x + k, y);
+            cr.line_to(x + w, y);
+            cr.line_to(x + w - k, y + h);
+            cr.line_to(x, y + h);
+            cr.close_path();
+        }
+        Shape::Flag => {
+            cr.move_to(x, y);
+            cr.line_to(x + w, y);
+            cr.line_to(x + w, y + h);
+            cr.line_to(x, y + h);
+            cr.line_to(x + w * 0.25, cy);
+            cr.close_path();
+        }
+        Shape::Cylinder => {
+            let (top, bot, e) = (cy - s * 0.42, cy + s * 0.42, s * 0.16);
+            cr.new_sub_path();
+            cr.save().ok();
+            cr.translate(cx, top + e);
+            cr.scale(s / 2.0, e);
+            cr.arc(0.0, 0.0, 1.0, 0.0, 2.0 * PI);
+            cr.restore().ok();
+            cr.move_to(x, top + e);
+            cr.line_to(x, bot - e);
+            cr.save().ok();
+            cr.translate(cx, bot - e);
+            cr.scale(s / 2.0, e);
+            cr.arc_negative(-1.0, 0.0, 1.0, PI, 0.0);
+            cr.restore().ok();
+            cr.line_to(x + w, top + e);
+        }
     }
 }
 
@@ -54,6 +150,11 @@ impl FlowModel {
             lit_edges: HashSet::new(),
             matches: vec![],
             meas,
+            prev: vec![],
+            moved_at: None,
+            dim_from: 1.0,
+            dim_to: 1.0,
+            dim_at: None,
         };
         m.measure();
         m.relayout();
@@ -66,14 +167,59 @@ impl FlowModel {
             .nodes
             .iter()
             .map(|n| {
-                let (tw, th) = draw::measure(&self.meas, &n.label, if n.group { SMALL_BOLD } else { BODY });
                 if n.group {
-                    (tw + 70.0, TITLE_H + 14.0)
-                } else {
-                    shape_size(n.shape, tw, th)
+                    let (tw, _) = draw::measure(&self.meas, &n.label, SMALL_BOLD);
+                    return (tw + 90.0, TITLE_H + 14.0);
                 }
+                let (title, sub) = split_label(&n.label);
+                let (tw, _) = draw::measure(&self.meas, &title, TITLE_FONT);
+                let sw = if sub.is_empty() { 0.0 } else { draw::measure(&self.meas, &sub, SMALL).0 };
+                let text = tw.max(sw).min(TEXT_MAX);
+                let w = (PAD + TILE + 10.0 + text + PAD + 4.0).max(150.0);
+                (w, if sub.is_empty() { 46.0 } else { 56.0 })
             })
             .collect();
+    }
+
+    fn group_note(n: usize) -> String {
+        format!("{n} items · click to expand")
+    }
+
+    /// Where node i is drawn now: between its old and new place while the layout moves.
+    fn shown_rect(&self, i: usize) -> Option<Rect> {
+        let new = self.lay.rects.get(i).copied().flatten()?;
+        let (Some(at), Some(Some(old))) = (self.moved_at, self.prev.get(i)) else { return Some(new) };
+        let k = ease(at, MOVE_MS);
+        if k >= 1.0 {
+            return Some(new);
+        }
+        let l = |a: f64, b: f64| a + (b - a) * k;
+        Some(Rect { x: l(old.x, new.x), y: l(old.y, new.y), w: l(old.w, new.w), h: l(old.h, new.h) })
+    }
+
+    fn moving(&self) -> bool {
+        self.moved_at.is_some_and(|at| ease(at, MOVE_MS) < 1.0)
+    }
+
+    /// Opacity of what lies outside the traced lineage.
+    fn dim_level(&self) -> f64 {
+        match self.dim_at {
+            Some(at) => self.dim_from + (self.dim_to - self.dim_from) * ease(at, FADE_MS),
+            None => self.dim_to,
+        }
+    }
+
+    fn select(&mut self, sel: Option<usize>) {
+        let was = self.selected.is_some();
+        self.selected = sel;
+        if sel.is_some() {
+            self.recompute_lit();
+        }
+        if was != sel.is_some() {
+            self.dim_from = self.dim_level();
+            self.dim_to = if sel.is_some() { DIM } else { 1.0 };
+            self.dim_at = Some(Instant::now());
+        }
     }
 
     fn hidden_count(&self, g: usize) -> usize {
@@ -99,20 +245,51 @@ impl FlowModel {
             .map(|(i, n)| {
                 let (mut w, mut h) = self.sizes[i];
                 if n.group && self.collapsed[i] {
-                    let (tw, _) = draw::measure(&self.meas, &format!("▸  {}", n.label), BODY);
-                    w = tw + 80.0;
-                    h = 44.0;
+                    let (tw, _) = draw::measure(&self.meas, &n.label, TITLE_FONT);
+                    let (sw, _) = draw::measure(&self.meas, &Self::group_note(self.hidden_count(i)), SMALL);
+                    w = (PAD + TILE + 10.0 + tw.max(sw).min(TEXT_MAX) + PAD + 46.0).max(190.0);
+                    h = 54.0;
                 }
                 LNode { w, h, parent: n.parent, group: n.group, collapsed: n.group && self.collapsed[i] }
             })
             .collect();
         let edges: Vec<(usize, usize)> = self.flow.edges.iter().map(|e| (e.from, e.to)).collect();
+        // leave room between ranks for the widest edge label (wide in LR, tall in TB)
+        let label_w = self
+            .flow
+            .edges
+            .iter()
+            .filter(|e| !e.label.is_empty())
+            .map(|e| draw::measure(&self.meas, &e.label, SMALL).0.min(220.0))
+            .fold(0.0, f64::max);
         let opts = if self.flow.dir.horizontal() {
-            Opts { node_gap: 22.0, rank_gap: 64.0, pad: 18.0, title_h: TITLE_H }
+            Opts { node_gap: 26.0, rank_gap: (label_w + 56.0).max(72.0), pad: 18.0, title_h: TITLE_H }
         } else {
-            Opts { node_gap: 30.0, rank_gap: 48.0, pad: 18.0, title_h: TITLE_H }
+            Opts { node_gap: 34.0, rank_gap: if label_w > 0.0 { 70.0 } else { 54.0 }, pad: 18.0, title_h: TITLE_H }
         };
+        let had = !self.lay.rects.is_empty();
+        let before: Vec<Option<Rect>> = (0..self.flow.nodes.len()).map(|i| if had { self.shown_rect(i) } else { None }).collect();
         self.lay = layout::layout(&nodes, &edges, self.flow.dir, opts);
+        if had {
+            // nodes that appear grow out of the card they were folded into
+            let mut prev = before.clone();
+            for i in 0..prev.len() {
+                if prev[i].is_some() {
+                    continue;
+                }
+                let Some(new) = self.lay.rects[i] else { continue };
+                let mut p = self.flow.nodes[i].parent;
+                while let Some(g) = p {
+                    if let Some(gr) = before[g] {
+                        prev[i] = Some(Rect { x: gr.cx() - new.w * 0.3, y: gr.cy() - new.h * 0.3, w: new.w * 0.6, h: new.h * 0.6 });
+                        break;
+                    }
+                    p = self.flow.nodes[g].parent;
+                }
+            }
+            self.prev = prev;
+            self.moved_at = Some(Instant::now());
+        }
         self.recompute_lit();
     }
 
@@ -162,11 +339,11 @@ impl FlowModel {
     }
 
     fn recompute_lit(&mut self) {
+        let Some(sel) = self.selected else { return };
         self.lit_nodes.clear();
         self.lit_edges.clear();
-        let Some(sel) = self.selected else { return };
         if self.lay.rects.get(sel).copied().flatten().is_none() {
-            self.selected = None;
+            self.select(None);
             return;
         }
         let vis: Vec<(usize, usize)> = self.flow.edges.iter().map(|e| (self.visible_rep(e.from), self.visible_rep(e.to))).collect();
@@ -229,64 +406,13 @@ impl FlowModel {
         }
         d
     }
-
-    fn shape_path(cr: &cairo::Context, shape: Shape, r: &Rect) {
-        let (x, y, w, h) = (r.x, r.y, r.w, r.h);
-        match shape {
-            Shape::Rect | Shape::Subroutine => draw::rounded(cr, x, y, w, h, 6.0),
-            Shape::Round => draw::rounded(cr, x, y, w, h, 12.0),
-            Shape::Stadium => draw::rounded(cr, x, y, w, h, h / 2.0),
-            Shape::Circle => {
-                cr.new_sub_path();
-                cr.arc(r.cx(), r.cy(), w.min(h) / 2.0, 0.0, 2.0 * PI);
-            }
-            Shape::Diamond => {
-                cr.move_to(r.cx(), y);
-                cr.line_to(x + w, r.cy());
-                cr.line_to(r.cx(), y + h);
-                cr.line_to(x, r.cy());
-                cr.close_path();
-            }
-            Shape::Hexagon => {
-                let k = 14.0;
-                cr.move_to(x + k, y);
-                cr.line_to(x + w - k, y);
-                cr.line_to(x + w, r.cy());
-                cr.line_to(x + w - k, y + h);
-                cr.line_to(x + k, y + h);
-                cr.line_to(x, r.cy());
-                cr.close_path();
-            }
-            Shape::Parallelogram => {
-                let k = 12.0;
-                cr.move_to(x + k, y);
-                cr.line_to(x + w, y);
-                cr.line_to(x + w - k, y + h);
-                cr.line_to(x, y + h);
-                cr.close_path();
-            }
-            Shape::Flag => {
-                cr.move_to(x, y);
-                cr.line_to(x + w, y);
-                cr.line_to(x + w, y + h);
-                cr.line_to(x, y + h);
-                cr.line_to(x + 12.0, r.cy());
-                cr.close_path();
-            }
-            Shape::Cylinder => {
-                let e = 7.0;
-                cr.new_sub_path();
-                cr.move_to(x, y + e);
-                cr.curve_to(x, y - e / 3.0, x + w, y - e / 3.0, x + w, y + e);
-                cr.line_to(x + w, y + h - e);
-                cr.curve_to(x + w, y + h + e / 3.0, x, y + h + e / 3.0, x, y + h - e);
-                cr.close_path();
-            }
-        }
-    }
 }
 
 impl Model for FlowModel {
+    fn animating(&self) -> bool {
+        self.moving() || self.dim_at.is_some_and(|at| ease(at, FADE_MS) < 1.0)
+    }
+
     fn size(&self) -> (f64, f64) {
         (self.lay.width, self.lay.height)
     }
@@ -294,154 +420,270 @@ impl Model for FlowModel {
     fn draw(&self, cr: &cairo::Context, w: &gtk::DrawingArea) {
         let t = draw::theme();
         let sel = self.selected.is_some();
-        let dim = |lit: bool| if sel && !lit { 0.28 } else { 1.0 };
+        let level = self.dim_level();
+        let dim = |lit: bool| if lit { 1.0 } else { level };
+        let moving = self.moving();
+        let horizontal = self.flow.dir.horizontal();
 
-        // groups, outermost first
+        // groups, outermost first: soft containers with a header row
         let mut groups: Vec<usize> = (0..self.flow.nodes.len())
-            .filter(|&i| self.flow.nodes[i].group && !self.collapsed[i] && self.lay.rects[i].is_some())
+            .filter(|&i| self.flow.nodes[i].group && !self.collapsed[i] && self.shown_rect(i).is_some())
             .collect();
         groups.sort_by_key(|&i| self.depth(i));
         for &g in &groups {
-            let r = self.lay.rects[g].unwrap();
+            let r = self.shown_rect(g).unwrap();
             let st = self.flow.style_of(g);
-            let base = st.fill.as_deref().and_then(draw::parse_color).unwrap_or(t.group);
-            let shade = draw::mix(base, t.fg, 0.025 * self.depth(g) as f64);
-            set(cr, shade, if st.fill.is_some() { 0.35 } else { 1.0 });
-            draw::rounded(cr, r.x, r.y, r.w, r.h, 10.0);
+            let tint = st.fill.as_deref().and_then(draw::parse_color);
+            cr.push_group();
+            let base = tint.map(|c| draw::mix(t.bg, c, if t.dark { 0.10 } else { 0.08 })).unwrap_or(t.group);
+            set(cr, draw::mix(base, t.fg, 0.015 * self.depth(g) as f64), 1.0);
+            draw::rounded(cr, r.x, r.y, r.w, r.h, 12.0);
             let _ = cr.fill_preserve();
             set(cr, st.stroke.as_deref().and_then(draw::parse_color).unwrap_or(t.border), 1.0);
             cr.set_line_width(1.0);
             let _ = cr.stroke();
+            // header divider
+            set(cr, t.border, 0.6);
+            cr.move_to(r.x + 1.0, r.y + TITLE_H + 0.5);
+            cr.line_to(r.right() - 1.0, r.y + TITLE_H + 0.5);
+            let _ = cr.stroke();
             let hovered = self.hover == Some(g);
-            let title = format!("▾  {}", self.flow.nodes[g].label);
-            draw::text(cr, w, &title, r.x + 12.0, r.y + 7.0, SMALL_BOLD, if hovered { t.accent } else { t.muted }, 1.0, 0.0, Some(r.w - 24.0));
+            let ink = if hovered { t.accent } else { t.muted };
+            draw::text(cr, w, "▾", r.x + 12.0, r.y + 6.0, SMALL, ink, 1.0, 0.0, None);
+            let (tw, _) = draw::text(cr, w, &self.flow.nodes[g].label, r.x + 28.0, r.y + 7.0, SMALL_BOLD, if hovered { t.accent } else { t.fg }, 0.9, 0.0, Some(r.w - 80.0));
+            let n = self.hidden_count(g);
+            draw::badge(cr, w, &n.to_string(), (r.x + 28.0 + tw + 18.0).min(r.right() - 20.0), r.y + TITLE_H / 2.0, Font { scale: 0.72, ..SMALL }, t.muted, t.card, t.border);
+            let _ = cr.pop_group_to_source();
+            let _ = cr.paint_with_alpha(0.7 + 0.3 * (level - DIM) / (1.0 - DIM));
         }
+
+        // ports: where edges leave and enter cards
+        let port = |r: &Rect, toward: (f64, f64)| -> (f64, f64) {
+            if horizontal {
+                if toward.0 >= r.cx() { (r.right(), r.cy()) } else { (r.x, r.cy()) }
+            } else if toward.1 >= r.cy() {
+                (r.cx(), r.bottom())
+            } else {
+                (r.cx(), r.y)
+            }
+        };
+        let mut ports: Vec<((f64, f64), f64)> = vec![];
 
         // edges
         cr.set_line_cap(cairo::LineCap::Round);
+        cr.set_line_join(cairo::LineJoin::Round);
+        let mut labels = vec![];
+        // Edges folded into the same pair of cards are drawn once, their labels merged.
+        let mut bundles: Vec<(usize, usize, Vec<usize>)> = vec![];
+        let mut index: HashMap<(usize, usize), usize> = HashMap::new();
         for (k, route) in self.lay.routes.iter().enumerate() {
             let Some(route) = route else { continue };
-            let e = &self.flow.edges[k];
-            if e.kind == EdgeKind::Invisible {
+            if self.flow.edges[k].kind == EdgeKind::Invisible {
                 continue;
             }
-            let (Some(ra), Some(rb)) = (self.lay.rects[route.from], self.lay.rects[route.to]) else { continue };
-            let first = route.points.first().copied().unwrap_or((rb.cx(), rb.cy()));
-            let last = route.points.last().copied().unwrap_or((ra.cx(), ra.cy()));
-            let mut pts = vec![draw::boundary(&ra, first)];
-            pts.extend(route.points.iter().copied());
-            pts.push(draw::boundary(&rb, last));
-            let lit = self.lit_edges.contains(&k);
-            let hot = self.hover.is_some_and(|h| h == route.from || h == route.to);
-            let color = if lit || hot { t.accent } else { t.edge };
-            let a = dim(lit);
-            set(cr, color, a);
-            cr.set_line_width(match e.kind {
-                EdgeKind::Thick => 2.6,
-                _ if lit || hot => 1.8,
-                _ => 1.3,
-            });
-            if e.kind == EdgeKind::Dotted {
-                cr.set_dash(&[4.0, 4.0], 0.0);
-            }
-            draw::smooth_path(cr, &pts);
-            let _ = cr.stroke();
-            cr.set_dash(&[], 0.0);
-            let n = pts.len();
-            if e.arrow_end {
-                draw::arrow_head(cr, pts[n - 1], pts[n - 2], 8.0);
-            }
-            if e.arrow_start {
-                draw::arrow_head(cr, pts[0], pts[1], 8.0);
-            }
-            if !e.label.is_empty() {
-                let mid = if n % 2 == 1 {
-                    pts[n / 2]
-                } else {
-                    ((pts[n / 2 - 1].0 + pts[n / 2].0) / 2.0, (pts[n / 2 - 1].1 + pts[n / 2].1) / 2.0)
-                };
-                cr.push_group();
-                draw::pill(cr, w, &e.label, mid.0, mid.1, SMALL, t.muted, t.bg);
-                let _ = cr.pop_group_to_source();
-                let _ = cr.paint_with_alpha(a);
+            match index.get(&(route.from, route.to)) {
+                Some(&b) => bundles[b].2.push(k),
+                None => {
+                    index.insert((route.from, route.to), bundles.len());
+                    bundles.push((route.from, route.to, vec![k]));
+                }
             }
         }
+        for (from, to, ks) in &bundles {
+            let k = ks[0];
+            let route = self.lay.routes[k].as_ref().unwrap();
+            let e = &self.flow.edges[k];
+            let (Some(ra), Some(rb)) = (self.shown_rect(*from), self.shown_rect(*to)) else { continue };
+            let direct = route.points.is_empty() || moving;
+            let first = if direct { (rb.cx(), rb.cy()) } else { route.points[0] };
+            let last = if direct { (ra.cx(), ra.cy()) } else { *route.points.last().unwrap() };
+            let (mut a, mut b) = (port(&ra, first), port(&rb, last));
+            // a pair linked both ways: bend the two curves apart
+            if index.contains_key(&(*to, *from)) {
+                let off = if from < to { -7.0 } else { 7.0 };
+                if horizontal {
+                    a.1 += off;
+                    b.1 += off;
+                } else {
+                    a.0 += off;
+                    b.0 += off;
+                }
+            }
+            let lit = ks.iter().any(|k| self.lit_edges.contains(k));
+            let shown_lit = lit && sel;
+            let hot = self.hover.is_some_and(|h| h == *from || h == *to);
+            let alpha = dim(lit);
+            ports.push((a, alpha));
+            ports.push((b, alpha));
+            set(cr, if shown_lit || hot { t.accent } else { t.edge }, alpha);
+            let thick = ks.iter().any(|k| self.flow.edges[*k].kind == EdgeKind::Thick);
+            cr.set_line_width(if thick {
+                2.8
+            } else if shown_lit {
+                2.2
+            } else if hot || ks.len() > 1 {
+                1.8
+            } else {
+                1.25
+            });
+            if ks.iter().all(|k| self.flow.edges[*k].kind == EdgeKind::Dotted) {
+                cr.set_dash(&[3.0, 4.0], 0.0);
+            }
+            // the curve leaves and enters along the flow axis
+            let axis = |p: (f64, f64), r: &Rect, d: f64| -> (f64, f64) {
+                if horizontal {
+                    (p.0 + if p.0 >= r.cx() { d } else { -d }, p.1)
+                } else {
+                    (p.0, p.1 + if p.1 >= r.cy() { d } else { -d })
+                }
+            };
+            let (mid, tail) = if direct {
+                draw::port_curve(cr, a, b, horizontal);
+                (((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0), axis(b, &rb, 10.0))
+            } else {
+                let mut pts = vec![a, axis(a, &ra, 14.0)];
+                pts.extend(route.points.iter().copied());
+                pts.push(axis(b, &rb, 14.0));
+                pts.push(b);
+                draw::smooth_path(cr, &pts);
+                let n = pts.len();
+                (pts[n / 2], pts[n - 2])
+            };
+            let _ = cr.stroke();
+            cr.set_dash(&[], 0.0);
+            if ks.iter().any(|k| self.flow.edges[*k].arrow_end) {
+                draw::arrow_head(cr, b, tail, 7.0);
+            }
+            if e.arrow_start {
+                draw::arrow_head(cr, a, axis(a, &ra, if direct { 10.0 } else { 14.0 }), 7.0);
+            }
+            let mut texts: Vec<&str> = ks.iter().map(|k| self.flow.edges[*k].label.as_str()).filter(|l| !l.is_empty()).collect();
+            texts.dedup();
+            let text = match texts.len() {
+                0 if ks.len() > 1 => format!("{} links", ks.len()),
+                0 => String::new(),
+                1 if ks.len() == 1 => texts[0].to_string(),
+                1 | 2 => texts.join(" · "),
+                _ => format!("{} links", ks.len()),
+            };
+            if !text.is_empty() {
+                labels.push((text, mid, alpha, shown_lit));
+            }
+        }
+        for (text, mid, alpha, lit) in labels {
+            cr.push_group();
+            draw::badge(cr, w, &text, mid.0, mid.1, SMALL, if lit { t.accent } else { t.muted }, t.card, if lit { t.accent } else { t.border });
+            let _ = cr.pop_group_to_source();
+            let _ = cr.paint_with_alpha(alpha);
+        }
 
-        // nodes
+        // cards
         for (i, n) in self.flow.nodes.iter().enumerate() {
-            let Some(r) = self.lay.rects[i] else { continue };
+            let Some(r) = self.shown_rect(i) else { continue };
             if n.group && !self.collapsed[i] {
                 continue;
             }
             let lit = self.lit_nodes.contains(&i);
-            let a = dim(lit);
             let st = self.flow.style_of(i);
-            let fill = st.fill.as_deref().and_then(draw::parse_color).unwrap_or(t.card);
-            let stroke = st.stroke.as_deref().and_then(draw::parse_color).unwrap_or(t.border);
-            let ink = st
-                .color
-                .as_deref()
-                .and_then(draw::parse_color)
-                .unwrap_or(if st.fill.is_none() {
-                    t.fg
-                } else if draw::luminance(fill) < 0.5 {
-                    (1.0, 1.0, 1.0)
-                } else {
-                    crate::widgets::hex(0x1F1E1D)
-                });
+            let kc = st.fill.as_deref().and_then(draw::parse_color).unwrap_or_else(|| kind_color(n.shape));
+            let stroke = st.stroke.as_deref().and_then(draw::parse_color);
+            let hot = self.hover == Some(i);
+            let selected = self.selected == Some(i);
             cr.push_group();
             if n.group {
-                // collapsed group
-                set(cr, t.group, 1.0);
-                draw::rounded(cr, r.x, r.y, r.w, r.h, 10.0);
-                let _ = cr.fill_preserve();
-                set(cr, t.muted, 0.8);
-                cr.set_line_width(1.2);
-                cr.set_dash(&[5.0, 3.0], 0.0);
+                // collapsed group: a stack of cards
+                for k in [2.0, 1.0] {
+                    set(cr, draw::mix(t.card, t.bg, 0.35), 1.0);
+                    draw::rounded(cr, r.x + 4.0 * k, r.y - 3.0 * k + 3.0, r.w - 8.0 * k, r.h, 9.0);
+                    let _ = cr.fill_preserve();
+                    set(cr, t.border, 1.0);
+                    cr.set_line_width(1.0);
+                    let _ = cr.stroke();
+                }
+            }
+            draw::shadow(cr, r.x, r.y, r.w, r.h, 9.0, t.dark);
+            set(cr, t.card, 1.0);
+            draw::rounded(cr, r.x, r.y, r.w, r.h, 9.0);
+            let _ = cr.fill();
+            if selected {
+                set(cr, t.accent, 0.18);
+                cr.set_line_width(6.0);
+                draw::rounded(cr, r.x - 2.0, r.y - 2.0, r.w + 4.0, r.h + 4.0, 11.0);
                 let _ = cr.stroke();
-                cr.set_dash(&[], 0.0);
-                draw::text(cr, w, &format!("▸  {}", n.label), r.x + 12.0, r.cy() - 9.0, BODY, t.fg, 1.0, 0.0, Some(r.w - 56.0));
-                draw::pill(cr, w, &format!("+{}", self.hidden_count(i)), r.right() - 22.0, r.cy(), SMALL, t.muted, t.card);
+            }
+            let border = if selected || hot || lit && sel { t.accent } else { stroke.unwrap_or(t.border) };
+            set(cr, border, 1.0);
+            cr.set_line_width(if selected { 2.0 } else if hot { 1.5 } else { 1.0 });
+            if st.dashed || n.group {
+                cr.set_dash(&[4.0, 3.0], 0.0);
+            }
+            draw::rounded(cr, r.x + 0.5, r.y + 0.5, r.w - 1.0, r.h - 1.0, 9.0);
+            let _ = cr.stroke();
+            cr.set_dash(&[], 0.0);
+
+            // icon tile with the node's shape
+            let (tx, ty) = (r.x + PAD, r.cy() - TILE / 2.0);
+            set(cr, kc, if t.dark { 0.20 } else { 0.12 });
+            draw::rounded(cr, tx, ty, TILE, TILE, 7.0);
+            let _ = cr.fill();
+            set(cr, kc, 1.0);
+            cr.set_line_width(1.5);
+            if n.group {
+                mini_shape(cr, Shape::Rect, tx + TILE / 2.0 + 2.0, ty + TILE / 2.0 + 2.0, 12.0);
+                let _ = cr.stroke();
+                set(cr, kc, if t.dark { 0.20 } else { 0.12 });
+                draw::rounded(cr, tx + 7.0, ty + 7.0, 13.0, 10.0, 1.5);
+                let _ = cr.fill();
+                set(cr, kc, 1.0);
+                draw::rounded(cr, tx + 7.0, ty + 7.0, 13.0, 10.0, 1.5);
+                let _ = cr.stroke();
             } else {
-                Self::shape_path(cr, n.shape, &r);
-                set(cr, fill, 1.0);
-                let _ = cr.fill_preserve();
-                let hot = self.hover == Some(i) || self.selected == Some(i);
-                set(cr, if hot { t.accent } else { stroke }, 1.0);
-                cr.set_line_width(st.stroke_width.unwrap_or(if hot { 1.8 } else { 1.0 }));
-                if st.dashed {
-                    cr.set_dash(&[4.0, 3.0], 0.0);
-                }
+                mini_shape(cr, n.shape, tx + TILE / 2.0, ty + TILE / 2.0, 14.0);
                 let _ = cr.stroke();
-                cr.set_dash(&[], 0.0);
-                if n.shape == Shape::Subroutine {
-                    set(cr, stroke, 1.0);
-                    cr.move_to(r.x + 7.0, r.y);
-                    cr.line_to(r.x + 7.0, r.bottom());
-                    cr.move_to(r.right() - 7.0, r.y);
-                    cr.line_to(r.right() - 7.0, r.bottom());
-                    let _ = cr.stroke();
+            }
+
+            // text
+            let ink = st.color.as_deref().and_then(draw::parse_color).unwrap_or(t.fg);
+            let x = tx + TILE + 10.0;
+            let max = r.right() - x - PAD - if n.group { 44.0 } else { 0.0 };
+            if n.group {
+                draw::text(cr, w, &n.label, x, r.cy() - 17.0, TITLE_FONT, ink, 1.0, 0.0, Some(max));
+                draw::text(cr, w, &Self::group_note(self.hidden_count(i)), x, r.cy() + 1.0, SMALL, t.muted, 1.0, 0.0, Some(max));
+                draw::badge(cr, w, &format!("+{}", self.hidden_count(i)), r.right() - 26.0, r.cy(), Font { scale: 0.75, ..SMALL_BOLD }, t.accent, t.card, t.border);
+            } else {
+                let (title, subtitle) = split_label(&n.label);
+                if subtitle.is_empty() {
+                    draw::text(cr, w, &title, x, r.cy() - 9.0, TITLE_FONT, ink, 1.0, 0.0, Some(max));
+                } else {
+                    draw::text(cr, w, &title, x, r.cy() - 18.0, TITLE_FONT, ink, 1.0, 0.0, Some(max));
+                    draw::text(cr, w, &subtitle, x, r.cy() + 1.0, SMALL, t.muted, 1.0, 0.0, Some(max));
                 }
-                if n.shape == Shape::Cylinder {
-                    set(cr, stroke, 1.0);
-                    cr.move_to(r.x, r.y + 7.0);
-                    cr.curve_to(r.x, r.y + 7.0 + 9.0, r.right(), r.y + 7.0 + 9.0, r.right(), r.y + 7.0);
-                    let _ = cr.stroke();
-                }
-                let cy = if n.shape == Shape::Cylinder { r.cy() + 4.0 } else { r.cy() };
-                draw::text_centered(cr, w, &n.label, r.cx(), cy, BODY, ink, 1.0);
                 if n.link.is_some() {
-                    draw::text(cr, w, "↗", r.right() - 5.0, r.y + 2.0, Font { scale: 0.7, ..SMALL }, t.accent, 1.0, 1.0, None);
+                    draw::text(cr, w, "↗", r.right() - 8.0, r.y + 4.0, Font { scale: 0.72, ..SMALL }, t.accent, 1.0, 1.0, None);
                 }
             }
             if self.matches.contains(&i) {
                 set(cr, t.accent, 1.0);
-                cr.set_line_width(2.5);
-                draw::rounded(cr, r.x - 4.0, r.y - 4.0, r.w + 8.0, r.h + 8.0, 9.0);
+                cr.set_line_width(2.0);
+                cr.set_dash(&[5.0, 3.0], 0.0);
+                draw::rounded(cr, r.x - 5.0, r.y - 5.0, r.w + 10.0, r.h + 10.0, 13.0);
                 let _ = cr.stroke();
+                cr.set_dash(&[], 0.0);
             }
             let _ = cr.pop_group_to_source();
-            let _ = cr.paint_with_alpha(a);
+            let _ = cr.paint_with_alpha(dim(lit));
+        }
+
+        // port dots on top of the card borders
+        for (p, alpha) in ports {
+            set(cr, t.card, alpha);
+            // text leaves the pen where the last label was; never join it to the dot
+            cr.new_path();
+            cr.arc(p.0, p.1, 3.5, 0.0, 2.0 * PI);
+            let _ = cr.fill_preserve();
+            set(cr, t.edge, alpha);
+            cr.set_line_width(1.2);
+            let _ = cr.stroke();
         }
     }
 
@@ -495,14 +737,13 @@ impl Model for FlowModel {
                         return Reaction::Open(path, line);
                     }
                 }
-                self.selected = if self.selected == Some(i) { None } else { Some(i) };
-                self.recompute_lit();
+                self.select(if self.selected == Some(i) { None } else { Some(i) });
                 Reaction::Redraw
             }
             None => {
-                if self.selected.take().is_some() || !self.matches.is_empty() {
+                if self.selected.is_some() || !self.matches.is_empty() {
                     self.matches.clear();
-                    self.recompute_lit();
+                    self.select(None);
                     return Reaction::Redraw;
                 }
                 Reaction::None

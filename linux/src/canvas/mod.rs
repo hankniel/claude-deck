@@ -1,5 +1,6 @@
-//! Canvas page: an explorer of agent sessions and their screens, and tabs that render each
-//! screen natively (flowcharts, lineage, ERDs, reviews, row counts, documents, files).
+//! Canvas: the tree of agent sessions and their screens (shown in the side bar) and the
+//! native views of each screen (flowcharts, lineage, ERDs, reviews, row counts, documents,
+//! files, git changes), which open as workbench tabs through `on_show`.
 
 pub mod board;
 pub mod draw;
@@ -16,7 +17,7 @@ use crate::widgets::label;
 use adw::prelude::*;
 use claude_deck::canvas::store::{self, Kind, Session};
 use claude_deck::canvas::{dbml, flow, lineage, sequence};
-use gtk::{gio, glib};
+use gtk::gio;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -30,9 +31,19 @@ enum Target {
     Screen(String, String),
 }
 
+/// A view the canvas asks the workbench to show.
+pub struct Shown {
+    pub key: String,
+    pub title: String,
+    pub icon: String,
+    pub tooltip: String,
+    pub crumb: String,
+    pub widget: gtk::Widget,
+    pub focus: bool,
+}
+
 struct Open {
     key: String,
-    page: adw::TabPage,
     holder: gtk::Box,
     sid: String,
     name: String,
@@ -40,11 +51,8 @@ struct Open {
 }
 
 pub struct CanvasPage {
-    pub root: gtk::Paned,
     explorer: gtk::ListBox,
     rows: RefCell<Vec<(gtk::ListBoxRow, Target)>>,
-    tabs: adw::TabView,
-    stack: gtk::Stack,
     sessions: RefCell<Vec<Session>>,
     expanded: RefCell<HashSet<String>>,
     show_ended: Cell<bool>,
@@ -52,8 +60,14 @@ pub struct CanvasPage {
     seen: RefCell<HashMap<String, i64>>,
     loaded: Cell<bool>,
     syncing: Cell<bool>,
+    current: RefCell<Option<String>>,
     pub on_toast: Callback<dyn Fn(&str)>,
-    pub on_title: Callback<dyn Fn(&str)>,
+    /// Show (open or reveal) a view as a tab.
+    pub on_show: Callback<dyn Fn(Shown)>,
+    /// Close the tab of a view.
+    pub on_hide: Callback<dyn Fn(&str)>,
+    /// A view's content was reloaded.
+    pub on_changed: Callback<dyn Fn(&str)>,
     me: RefCell<Weak<CanvasPage>>,
 }
 
@@ -87,66 +101,18 @@ pub fn state_text(s: &Session) -> String {
     }
 }
 
+pub fn screen_key(sid: &str, name: &str) -> String {
+    format!("screen:{sid}/{name}")
+}
+
 impl CanvasPage {
     pub fn new() -> Rc<CanvasPage> {
         let explorer = gtk::ListBox::new();
-        explorer.add_css_class("navigation-sidebar");
+        explorer.add_css_class("wb-tree");
         explorer.set_selection_mode(gtk::SelectionMode::Single);
-        let head = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        head.set_margin_start(14);
-        head.set_margin_end(8);
-        head.set_margin_top(10);
-        head.set_margin_bottom(4);
-        let t = label("Agent sessions", &["heading"]);
-        t.set_hexpand(true);
-        head.append(&t);
-        let ended = gtk::ToggleButton::new();
-        ended.set_icon_name("document-open-recent-symbolic");
-        ended.add_css_class("flat");
-        ended.set_tooltip_text(Some("Show ended sessions"));
-        head.append(&ended);
-        let side = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        side.append(&head);
-        let sc = gtk::ScrolledWindow::new();
-        sc.set_hscrollbar_policy(gtk::PolicyType::Never);
-        sc.set_vexpand(true);
-        sc.set_child(Some(&explorer));
-        side.append(&sc);
-        side.set_size_request(240, -1);
-
-        let tabs = adw::TabView::new();
-        let bar = adw::TabBar::new();
-        bar.set_view(Some(&tabs));
-        bar.set_autohide(false);
-        let tabbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        tabbox.append(&bar);
-        tabbox.append(&tabs);
-        tabs.set_vexpand(true);
-        let empty = adw::StatusPage::builder()
-            .icon_name("view-paged-symbolic")
-            .title("Canvas")
-            .description(
-                "Screens your agents draw show up here: flowcharts (.mmd), data lineage (.lineage), database diagrams (.dbml), review findings (.rv), row counts (.rows) and documents to comment on (.doc).\n\nAgents learn the formats from the canvas skill; ask one to draw something.",
-            )
-            .build();
-        let stack = gtk::Stack::new();
-        stack.add_named(&empty, Some("empty"));
-        stack.add_named(&tabbox, Some("tabs"));
-        stack.set_visible_child_name("empty");
-
-        let root = gtk::Paned::new(gtk::Orientation::Horizontal);
-        root.set_start_child(Some(&side));
-        root.set_end_child(Some(&stack));
-        root.set_position(280);
-        root.set_shrink_start_child(false);
-        root.set_resize_start_child(false);
-
         let page = Rc::new(CanvasPage {
-            root,
             explorer,
             rows: RefCell::new(vec![]),
-            tabs,
-            stack,
             sessions: RefCell::new(vec![]),
             expanded: RefCell::new(HashSet::new()),
             show_ended: Cell::new(false),
@@ -154,19 +120,15 @@ impl CanvasPage {
             seen: RefCell::new(HashMap::new()),
             loaded: Cell::new(false),
             syncing: Cell::new(false),
+            current: RefCell::new(None),
             on_toast: RefCell::new(None),
-            on_title: RefCell::new(None),
+            on_show: RefCell::new(None),
+            on_hide: RefCell::new(None),
+            on_changed: RefCell::new(None),
             me: RefCell::new(Weak::new()),
         });
         *page.me.borrow_mut() = Rc::downgrade(&page);
 
-        let me = Rc::downgrade(&page);
-        ended.connect_toggled(move |b| {
-            if let Some(p) = me.upgrade() {
-                p.show_ended.set(b.is_active());
-                p.rebuild_explorer();
-            }
-        });
         let me = Rc::downgrade(&page);
         page.explorer.connect_row_activated(move |_, row| {
             let Some(p) = me.upgrade() else { return };
@@ -190,24 +152,6 @@ impl CanvasPage {
                 None => {}
             }
         });
-        let me = Rc::downgrade(&page);
-        page.tabs.connect_close_page(move |view, tp| {
-            if let Some(p) = me.upgrade() {
-                p.open.borrow_mut().retain(|o| &o.page != tp);
-                if view.n_pages() <= 1 {
-                    p.stack.set_visible_child_name("empty");
-                }
-                p.emit_title();
-            }
-            glib::Propagation::Proceed
-        });
-        let me = Rc::downgrade(&page);
-        page.tabs.connect_selected_page_notify(move |_| {
-            if let Some(p) = me.upgrade() {
-                p.emit_title();
-                p.sync_selection();
-            }
-        });
         page
     }
 
@@ -217,19 +161,17 @@ impl CanvasPage {
         }
     }
 
-    fn emit_title(&self) {
-        let t = self
-            .tabs
-            .selected_page()
-            .map(|p| p.title().to_string())
-            .unwrap_or_default();
-        if let Some(f) = self.on_title.borrow().clone() {
-            f(&t);
+    fn show(&self, s: Shown) {
+        if let Some(f) = self.on_show.borrow().clone() {
+            f(s);
         }
     }
 
-    pub fn current_title(&self) -> String {
-        self.tabs.selected_page().map(|p| p.title().to_string()).unwrap_or_default()
+    fn hide(&self, key: &str) {
+        self.forget(key);
+        if let Some(f) = self.on_hide.borrow().clone() {
+            f(key);
+        }
     }
 
     pub fn session(&self, sid: &str) -> Option<Session> {
@@ -238,6 +180,27 @@ impl CanvasPage {
 
     pub fn sessions(&self) -> Vec<Session> {
         self.sessions.borrow().clone()
+    }
+
+    /// Does this tab key belong to the canvas?
+    pub fn owns(&self, key: &str) -> bool {
+        self.open.borrow().iter().any(|o| o.key == key)
+    }
+
+    /// The workbench closed a canvas tab.
+    pub fn forget(&self, key: &str) {
+        self.open.borrow_mut().retain(|o| o.key != key);
+    }
+
+    /// The workbench made a tab current: highlight its screen in the tree.
+    pub fn set_current(&self, key: Option<&str>) {
+        *self.current.borrow_mut() = key.map(String::from);
+        self.sync_selection();
+    }
+
+    pub fn set_show_ended(&self, on: bool) {
+        self.show_ended.set(on);
+        self.rebuild_explorer();
     }
 
     fn visible_session(&self, s: &Session) -> bool {
@@ -250,6 +213,10 @@ impl CanvasPage {
         !s.items.is_empty() || !s.state.state.is_empty()
     }
 
+    pub fn has_visible(&self) -> bool {
+        self.sessions.borrow().iter().any(|s| self.visible_session(s))
+    }
+
     fn rebuild_explorer(&self) {
         self.syncing.set(true);
         for (r, _) in self.rows.borrow_mut().drain(..) {
@@ -260,59 +227,61 @@ impl CanvasPage {
         let mut rows = vec![];
         for s in sessions.iter().filter(|s| self.visible_session(s)) {
             let row = gtk::ListBoxRow::new();
-            let h = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            h.set_margin_top(4);
-            h.set_margin_bottom(4);
+            let h = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let open = expanded.contains(&s.meta.id);
+            let chev = gtk::Image::from_icon_name(if open { "pan-down-symbolic" } else { "pan-end-symbolic" });
+            chev.add_css_class("dim");
+            chev.set_margin_start(8);
+            h.append(&chev);
             let color = state_color(&s.state.state).unwrap_or(crate::widgets::hex(0x8B8D98));
-            let dot = crate::widgets::dot(color, 8);
+            let dot = crate::widgets::dot(color, 7);
             dot.set_opacity(if s.state.state.is_empty() { 0.35 } else { 1.0 });
             dot.set_tooltip_text(Some(&state_text(s)));
             h.append(&dot);
-            let v = gtk::Box::new(gtk::Orientation::Vertical, 1);
-            v.set_hexpand(true);
             let t = label(&s.label(), &[]);
             t.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            v.append(&t);
+            h.append(&t);
             let mut sub = vec![];
             if !s.meta.project.is_empty() {
                 sub.push(s.meta.project.clone());
             }
-            if !s.meta.account.is_empty() {
-                sub.push(s.meta.account.clone());
-            }
             let st = state_text(s);
-            if !st.is_empty() {
-                sub.push(st);
+            if !st.is_empty() && s.needs_you() {
+                sub.push(st.clone());
             }
-            sub.push(ago(s.updated));
-            let sl = label(&sub.join(" · "), &["caption", "dim-label"]);
+            let sl = label(&sub.join(" · "), &[if s.needs_you() { "warn" } else { "meta" }]);
             sl.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            if s.needs_you() {
-                sl.remove_css_class("dim-label");
-                sl.add_css_class("warning");
+            sl.set_hexpand(true);
+            h.append(&sl);
+            if !s.items.is_empty() {
+                h.append(&label(&s.items.len().to_string(), &["meta", "numeric"]));
             }
-            v.append(&sl);
-            h.append(&v);
-            let open = expanded.contains(&s.meta.id);
-            let n = label(&format!("{} {}", s.items.len(), if open { "▾" } else { "▸" }), &["caption", "dim-label", "numeric"]);
-            h.append(&n);
             row.set_child(Some(&h));
-            row.set_tooltip_text(Some(&format!("{}\n{}", s.meta.cwd, s.meta.id)));
+            let mut tip = vec![s.label()];
+            if !s.meta.account.is_empty() {
+                tip.push(format!("account: {}", s.meta.account));
+            }
+            if !st.is_empty() {
+                tip.push(st.clone());
+            }
+            tip.push(format!("updated {}", ago(s.updated)));
+            tip.push(s.meta.cwd.clone());
+            row.set_tooltip_text(Some(&tip.join("\n")));
             self.explorer.append(&row);
             rows.push((row, Target::Session(s.meta.id.clone())));
             if open {
                 for it in &s.items {
                     let r = gtk::ListBoxRow::new();
-                    let b = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                    b.set_margin_start(18);
+                    let b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                    b.set_margin_start(36);
                     let i = gtk::Image::from_icon_name(it.kind.icon());
-                    i.add_css_class("dim-label");
+                    i.add_css_class("dim");
                     b.append(&i);
                     let nl = label(&it.name, &[]);
                     nl.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
                     nl.set_hexpand(true);
                     b.append(&nl);
-                    b.append(&label(&ago(it.mtime), &["caption", "dim-label"]));
+                    b.append(&label(&ago(it.mtime), &["meta"]));
                     r.set_child(Some(&b));
                     self.explorer.append(&r);
                     rows.push((r, Target::Screen(s.meta.id.clone(), it.name.clone())));
@@ -327,12 +296,11 @@ impl CanvasPage {
     fn sync_selection(&self) {
         self.syncing.set(true);
         self.explorer.unselect_all();
-        if let Some(sel) = self.tabs.selected_page() {
-            if let Some(o) = self.open.borrow().iter().find(|o| o.page == sel) {
-                for (r, t) in self.rows.borrow().iter() {
-                    if matches!(t, Target::Screen(s, n) if *s == o.sid && *n == o.name) {
-                        self.explorer.select_row(Some(r));
-                    }
+        let cur = self.current.borrow().clone();
+        if let Some(o) = cur.and_then(|k| self.open.borrow().iter().find(|o| o.key == k).map(|o| (o.sid.clone(), o.name.clone()))) {
+            for (r, t) in self.rows.borrow().iter() {
+                if matches!(t, Target::Screen(s, n) if *s == o.0 && *n == o.1) {
+                    self.explorer.select_row(Some(r));
                 }
             }
         }
@@ -353,7 +321,7 @@ impl CanvasPage {
     }
 
     /// New data from disk. Returns screens that appeared or changed (session id, name).
-    pub fn update(&self, sessions: Vec<Session>, visible: bool) -> Vec<(String, String)> {
+    pub fn update(&self, sessions: Vec<Session>) -> Vec<(String, String)> {
         let first = !self.loaded.get();
         if first {
             let mut e = self.expanded.borrow_mut();
@@ -378,24 +346,24 @@ impl CanvasPage {
         self.loaded.set(true);
 
         // open tabs: reload changed, close deleted
-        let open: Vec<(String, String, i64, adw::TabPage)> =
-            self.open.borrow().iter().map(|o| (o.sid.clone(), o.name.clone(), o.mtime, o.page.clone())).collect();
-        for (sid, name, mtime, page) in open {
+        let open: Vec<(String, String, String, i64)> =
+            self.open.borrow().iter().map(|o| (o.key.clone(), o.sid.clone(), o.name.clone(), o.mtime)).collect();
+        for (key, sid, name, mtime) in open {
             if sid.is_empty() {
-                continue; // a file tab
+                continue; // a file or changes tab
             }
             match sessions.iter().find(|s| s.meta.id == sid).and_then(|s| s.items.iter().find(|i| i.name == name)) {
                 Some(it) if it.mtime > mtime => self.reload(&sid, &name),
                 Some(_) => {}
-                None => self.tabs.close_page(&page),
+                None => self.hide(&key),
             }
         }
         for (sid, name) in &changed {
             let live = sessions.iter().find(|s| &s.meta.id == sid).is_some_and(|s| s.state.state != "ended");
-            let already = self.open.borrow().iter().any(|o| &o.sid == sid && &o.name == name);
+            let already = self.owns(&screen_key(sid, name));
             if live && !already {
                 self.expanded.borrow_mut().insert(sid.clone());
-                self.open_screen(sid, name, visible);
+                self.open_screen(sid, name, false);
             }
         }
         self.rebuild_explorer();
@@ -407,7 +375,7 @@ impl CanvasPage {
         Rc::new(move |p: String, line: Option<u32>| {
             let Some(page) = me.upgrade() else { return };
             if p.starts_with("http://") || p.starts_with("https://") {
-                let win = page.root.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+                let win = page.explorer.root().and_then(|r| r.downcast::<gtk::Window>().ok());
                 gtk::UriLauncher::new(&p).launch(win.as_ref(), None::<&gio::Cancellable>, |_| {});
                 return;
             }
@@ -482,47 +450,67 @@ impl CanvasPage {
         (w, mtime)
     }
 
-    fn select_page(&self, page: &adw::TabPage, focus: bool) {
-        self.stack.set_visible_child_name("tabs");
-        if focus || self.tabs.selected_page().is_none() {
-            self.tabs.set_selected_page(page);
+    fn holder_with(w: &gtk::Widget) -> gtk::Box {
+        let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        w.set_vexpand(true);
+        holder.append(w);
+        holder
+    }
+
+    fn reveal(&self, key: &str, focus: bool) -> bool {
+        if !self.owns(key) {
+            return false;
         }
+        self.show(Shown {
+            key: key.to_string(),
+            title: String::new(),
+            icon: String::new(),
+            tooltip: String::new(),
+            crumb: String::new(),
+            widget: gtk::Box::new(gtk::Orientation::Vertical, 0).upcast(),
+            focus,
+        });
+        true
     }
 
     pub fn open_screen(&self, sid: &str, name: &str, focus: bool) {
-        let key = format!("{sid}/{name}");
-        if let Some(p) = self.open.borrow().iter().find(|o| o.key == key).map(|o| o.page.clone()) {
-            self.select_page(&p, focus);
+        let key = screen_key(sid, name);
+        if self.reveal(&key, focus) {
             return;
         }
         let Some(s) = self.session(sid) else { return };
         let (w, mtime) = self.build(&s, name);
-        let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        w.set_vexpand(true);
-        holder.append(&w);
-        let page = self.tabs.append(&holder);
-        page.set_title(name);
-        page.set_tooltip(&glib::markup_escape_text(&format!("{} — {}", s.label(), s.meta.cwd)));
-        if let Some(k) = Kind::of(name) {
-            page.set_icon(Some(&gio::ThemedIcon::new(k.icon())));
-        }
-        self.open.borrow_mut().push(Open { key, page: page.clone(), holder, sid: sid.into(), name: name.into(), mtime });
-        self.select_page(&page, focus);
-        self.emit_title();
+        let holder = Self::holder_with(&w);
+        self.open.borrow_mut().push(Open { key: key.clone(), holder: holder.clone(), sid: sid.into(), name: name.into(), mtime });
+        let project = if s.meta.project.is_empty() { crate::model::last_component(&s.meta.cwd) } else { s.meta.project.clone() };
+        self.show(Shown {
+            key,
+            title: name.to_string(),
+            icon: Kind::of(name).map(|k| k.icon()).unwrap_or("text-x-generic-symbolic").to_string(),
+            tooltip: format!("{} — {}", s.label(), s.meta.cwd),
+            crumb: format!("canvas  ›  {project}  ›  {name}"),
+            widget: holder.upcast(),
+            focus,
+        });
     }
 
     fn reload(&self, sid: &str, name: &str) {
         let Some(s) = self.session(sid) else { return };
         let (w, mtime) = self.build(&s, name);
-        let mut open = self.open.borrow_mut();
-        let Some(o) = open.iter_mut().find(|o| o.sid == sid && o.name == name) else { return };
-        while let Some(c) = o.holder.first_child() {
-            o.holder.remove(&c);
+        let key = {
+            let mut open = self.open.borrow_mut();
+            let Some(o) = open.iter_mut().find(|o| o.sid == sid && o.name == name) else { return };
+            while let Some(c) = o.holder.first_child() {
+                o.holder.remove(&c);
+            }
+            w.set_vexpand(true);
+            o.holder.append(&w);
+            o.mtime = mtime;
+            o.key.clone()
+        };
+        if let Some(f) = self.on_changed.borrow().clone() {
+            f(&key);
         }
-        w.set_vexpand(true);
-        o.holder.append(&w);
-        o.mtime = mtime;
-        o.page.set_needs_attention(self.tabs.selected_page().as_ref() != Some(&o.page));
     }
 
     pub fn open_file(&self, path: &Path, line: Option<u32>) {
@@ -530,50 +518,61 @@ impl CanvasPage {
         let on_open = self.on_open_fn(path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default());
         let w = screens::file(path, line, on_open);
         w.set_vexpand(true);
-        let existing = self.open.borrow().iter().find(|o| o.key == key).map(|o| (o.page.clone(), o.holder.clone()));
-        if let Some((page, holder)) = existing {
+        let existing = self.open.borrow().iter().find(|o| o.key == key).map(|o| o.holder.clone());
+        if let Some(holder) = existing {
             while let Some(c) = holder.first_child() {
                 holder.remove(&c);
             }
             holder.append(&w);
-            self.select_page(&page, true);
+            self.reveal(&key, true);
             return;
         }
-        let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        holder.append(&w);
-        let page = self.tabs.append(&holder);
+        let holder = Self::holder_with(&w);
         let title = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
-        page.set_title(&title);
-        page.set_tooltip(&glib::markup_escape_text(&path.to_string_lossy()));
-        page.set_icon(Some(&gio::ThemedIcon::new(if path.is_dir() { "folder-symbolic" } else { "text-x-generic-symbolic" })));
-        self.open.borrow_mut().push(Open { key, page: page.clone(), holder, sid: String::new(), name: title, mtime: 0 });
-        self.select_page(&page, true);
+        self.open.borrow_mut().push(Open { key: key.clone(), holder: holder.clone(), sid: String::new(), name: title.clone(), mtime: 0 });
+        let crumb = path
+            .to_string_lossy()
+            .replace(&claude_deck::config::home().to_string_lossy().to_string(), "~")
+            .trim_start_matches('/')
+            .split('/')
+            .collect::<Vec<_>>()
+            .join("  ›  ");
+        self.show(Shown {
+            key,
+            title,
+            icon: crate::files::icon_for(path).to_string(),
+            tooltip: path.to_string_lossy().to_string(),
+            crumb,
+            widget: holder.upcast(),
+            focus: true,
+        });
     }
 
     /// Git changes of a folder, in a tab.
     pub fn open_changes(&self, dir: &Path, title: &str) {
         let key = format!("changes:{}", dir.display());
-        if let Some(p) = self.open.borrow().iter().find(|o| o.key == key).map(|o| o.page.clone()) {
-            self.select_page(&p, true);
+        if self.reveal(&key, true) {
             return;
         }
         let w = gitview::changes(dir.to_path_buf());
-        w.set_vexpand(true);
-        let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        holder.append(&w);
-        let page = self.tabs.append(&holder);
-        page.set_title(&format!("Changes · {title}"));
-        page.set_tooltip(&glib::markup_escape_text(&dir.to_string_lossy()));
-        page.set_icon(Some(&gio::ThemedIcon::new("emblem-documents-symbolic")));
-        self.open.borrow_mut().push(Open { key, page: page.clone(), holder, sid: String::new(), name: String::new(), mtime: 0 });
-        self.select_page(&page, true);
+        let holder = Self::holder_with(&w);
+        self.open.borrow_mut().push(Open { key: key.clone(), holder: holder.clone(), sid: String::new(), name: String::new(), mtime: 0 });
+        self.show(Shown {
+            key,
+            title: format!("Changes · {title}"),
+            icon: "emblem-documents-symbolic".into(),
+            tooltip: dir.to_string_lossy().to_string(),
+            crumb: format!("source control  ›  {title}"),
+            widget: holder.upcast(),
+            focus: true,
+        });
     }
 
     pub fn delete_session(&self, sid: &str) {
         let Some(s) = self.session(sid) else { return };
-        let pages: Vec<adw::TabPage> = self.open.borrow().iter().filter(|o| o.sid == sid).map(|o| o.page.clone()).collect();
-        for p in pages {
-            self.tabs.close_page(&p);
+        let keys: Vec<String> = self.open.borrow().iter().filter(|o| o.sid == sid).map(|o| o.key.clone()).collect();
+        for k in keys {
+            self.hide(&k);
         }
         match store::delete_session(&s.dir) {
             Ok(()) => self.toast("Session removed from the canvas"),
@@ -583,23 +582,15 @@ impl CanvasPage {
 
     pub fn delete_screen(&self, sid: &str, name: &str) {
         let Some(s) = self.session(sid) else { return };
-        let pages: Vec<adw::TabPage> = self.open.borrow().iter().filter(|o| o.sid == sid && o.name == name).map(|o| o.page.clone()).collect();
-        for p in pages {
-            self.tabs.close_page(&p);
-        }
+        self.hide(&screen_key(sid, name));
         if let Err(e) = store::delete_screen(&s.dir, name) {
             self.toast(&format!("{e:#}"));
         }
     }
 
-    pub fn close_current(&self) -> bool {
-        match self.tabs.selected_page() {
-            Some(p) => {
-                self.tabs.close_page(&p);
-                true
-            }
-            None => false,
-        }
+    /// Open screens of a session, newest first (for "go to session").
+    pub fn first_screen(&self, sid: &str) -> Option<String> {
+        self.session(sid).and_then(|s| s.items.iter().max_by_key(|i| i.mtime).map(|i| i.name.clone()))
     }
 }
 
@@ -621,7 +612,7 @@ fn osd_box() -> gtk::Box {
 fn flow_widget(f: flow::Flow, on_open: screens::OpenFn) -> gtk::Widget {
     let has_groups = f.nodes.iter().any(|n| n.group);
     let d = Diagram::new(flowview::FlowModel::new(f), on_open);
-    d.set_fit(0.55, None);
+    d.set_fit(0.85, None);
     let search = gtk::SearchEntry::new();
     search.set_placeholder_text(Some("Find a node"));
     search.set_width_chars(16);
