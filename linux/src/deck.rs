@@ -36,6 +36,10 @@ pub enum Sel {
     Dashboard,
 }
 
+fn restore_path() -> PathBuf {
+    claude_deck::config::data_dir().join("restore-tabs.json")
+}
+
 pub fn term_key(id: &str) -> String {
     format!("term:{id}")
 }
@@ -552,6 +556,7 @@ impl Deck {
         });
         let d = deck.clone();
         glib::timeout_add_seconds_local(30, move || {
+            d.save_tabs();
             let poll = d.config.borrow().poll_secs.max(30);
             if d.last_refresh.get().is_none_or(|t| t.elapsed() >= Duration::from_secs(poll)) {
                 d.refresh(true);
@@ -576,7 +581,9 @@ impl Deck {
 
         deck.rebuild_accounts();
         let panel_was_shown = deck.wb.panel_shown();
-        deck.new_tab(None, None);
+        if !deck.restore_tabs() {
+            deck.new_tab(None, None);
+        }
         if !panel_was_shown {
             // the first terminal must not overrule a panel the user had hidden
             deck.wb.set_panel_shown(false);
@@ -787,13 +794,26 @@ impl Deck {
         add("prev-tab", Box::new(|d| d.cycle(-1)));
         // Copy/paste follow the focus: a terminal, else the focused text (file view, note, label).
         add("copy", Box::new(|d| match d.focused_tab() {
-            Some(t) => t.term.copy_clipboard_format(vte::Format::Text),
+            // Claude Code selects with the mouse itself and copies on select; copying the
+            // terminal's empty selection would wipe what it just put on the clipboard.
+            Some(t) => {
+                if t.term.has_selection() {
+                    t.term.copy_clipboard_format(vte::Format::Text);
+                }
+            }
             None => d.focus_action("clipboard.copy"),
         }));
         add("paste", Box::new(|d| match d.focused_tab() {
             Some(t) => {
                 t.last_input.set(Instant::now());
-                vte::prelude::TerminalExt::paste_clipboard(&t.term);
+                // An image with no text: send Ctrl+V so Claude Code reads the image itself.
+                let f = t.term.clipboard().formats();
+                let text = f.contain_mime_type("text/plain") || f.contain_mime_type("text/plain;charset=utf-8") || f.contains_type(glib::Type::STRING);
+                if !text && f.contains_type(gdk::Texture::static_type()) {
+                    t.term.feed_child(b"\x16");
+                } else {
+                    vte::prelude::TerminalExt::paste_clipboard(&t.term);
+                }
             }
             None => d.focus_action("clipboard.paste"),
         }));
@@ -1030,6 +1050,7 @@ impl Deck {
         }
         self.tab_changed();
         self.rebuild_accounts();
+        self.save_tabs();
     }
 
     fn select_index(self: &Rc<Self>, i: usize) {
@@ -1694,8 +1715,10 @@ impl Deck {
                     account: account.to_string(),
                     session_id: v.get("session_id").and_then(|s| s.as_str()).map(String::from),
                     cwd: v.get("cwd").and_then(|c| c.as_str()).map(String::from).unwrap_or_else(|| tab.cwd.borrow().clone()),
+                    started: std::time::SystemTime::now(),
                 });
                 tab.warned.set(false);
+                self.save_tabs();
                 self.tab_changed();
                 self.rebuild_accounts();
                 self.refresh(false);
@@ -2055,7 +2078,58 @@ impl Deck {
         }
     }
 
+    /// Remember every terminal (folder, and Claude's account and conversation) for the next start.
+    /// Saved continuously, not only on quit: a power-off kills the app without a quit.
+    /// Tabs whose shell died stay listed, since a logout kills shells before the app.
+    fn save_tabs(&self) {
+        let mut claimed: Vec<String> = vec![];
+        let mut out = vec![];
+        for t in self.tabs.borrow().iter() {
+            match t.claude.borrow().as_ref() {
+                Some(r) => {
+                    let sid = claude_deck::pty::current_session(
+                        &claude_deck::config::default_claude_dir(),
+                        Path::new(&r.cwd),
+                        r.started,
+                        r.session_id.clone(),
+                        &claimed,
+                    );
+                    if let Some(s) = &sid {
+                        claimed.push(s.clone());
+                    }
+                    out.push(json!({"cwd": r.cwd, "account": r.account, "session": sid}));
+                }
+                None => out.push(json!({"cwd": t.cwd.borrow().clone()})),
+            }
+        }
+        let tmp = restore_path().with_extension("json.tmp");
+        if std::fs::write(&tmp, Value::Array(out).to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, restore_path());
+        }
+    }
+
+    /// Reopen the terminals of the last run, resuming their Claude conversations.
+    fn restore_tabs(self: &Rc<Self>) -> bool {
+        let Ok(s) = std::fs::read_to_string(restore_path()) else { return false };
+        let Ok(Value::Array(tabs)) = serde_json::from_str::<Value>(&s) else { return false };
+        let bin = if self.cli.is_some() { "\"$CC_DECK_BIN\"" } else { "claude-deck" };
+        let mut opened = false;
+        for e in tabs {
+            let Some(cwd) = e.get("cwd").and_then(|c| c.as_str()).filter(|c| Path::new(c).is_dir()) else { continue };
+            let run = e.get("account").and_then(|a| a.as_str()).filter(|a| accounts::valid_name(a).is_ok()).map(|acc| {
+                match e.get("session").and_then(|s| s.as_str()).filter(|s| s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')) {
+                    Some(sid) => format!("{bin} launch --account {acc} -- --resume {sid}"),
+                    None => format!("{bin} launch --account {acc} -- --continue"),
+                }
+            });
+            self.new_tab(Some(cwd.to_string()), run);
+            opened = true;
+        }
+        opened
+    }
+
     pub fn shutdown(&self) {
+        self.save_tabs();
         self.wb.save();
         for t in self.tabs.borrow().iter() {
             t.terminate();

@@ -17,6 +17,7 @@ pub struct ClaudeRun {
     pub account: String,
     pub session_id: Option<String>,
     pub cwd: String,
+    pub started: std::time::SystemTime,
 }
 
 pub struct Tab {
@@ -260,25 +261,40 @@ impl Tab {
             }
         });
 
-        // Ctrl+click opens links (OSC 8 hyperlinks or plain URLs).
+        // A click on a link opens it (OSC 8 hyperlinks or plain URLs); a drag doesn't.
+        // Capture phase: with mouse tracking on (Claude Code), VTE takes the click for the app
+        // and a bubble-phase gesture never sees the release. The event still reaches VTE.
         let click = gtk::GestureClick::new();
         click.set_button(1);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let down: Rc<RefCell<Option<(f64, f64, String)>>> = Rc::new(RefCell::new(None));
+        let (d1, me1) = (down.clone(), Rc::downgrade(self));
+        click.connect_pressed(move |_, n, x, y| {
+            let Some(tab) = me1.upgrade() else { return };
+            let uri = (n == 1)
+                .then(|| {
+                    tab.term
+                        .check_hyperlink_at(x, y)
+                        .map(|s| s.to_string())
+                        .or_else(|| tab.term.check_match_at(x, y).0.map(|s| s.to_string()))
+                })
+                .flatten();
+            *d1.borrow_mut() = uri.map(|u| (x, y, u));
+        });
         let me = Rc::downgrade(self);
-        click.connect_released(move |g, _, x, y| {
+        click.connect_released(move |_, _, x, y| {
             let Some(tab) = me.upgrade() else { return };
-            if !g.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
+            let Some((x0, y0, uri)) = down.borrow_mut().take() else { return };
+            if (x - x0).abs() > 4.0 || (y - y0).abs() > 4.0 {
                 return;
             }
-            let uri = tab
-                .term
-                .check_hyperlink_at(x, y)
-                .map(|s| s.to_string())
-                .or_else(|| tab.term.check_match_at(x, y).0.map(|s| s.to_string()));
-            if let Some(uri) = uri {
-                let root = tab.term.root();
-                let win = root.and_then(|r| r.downcast::<gtk::Window>().ok());
-                gtk::UriLauncher::new(&uri).launch(win.as_ref(), None::<&gio::Cancellable>, |_| {});
-            }
+            let win = tab.term.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+            let fallback = uri.clone();
+            gtk::UriLauncher::new(&uri).launch(win.as_ref(), None::<&gio::Cancellable>, move |res| {
+                if res.is_err() {
+                    let _ = gio::AppInfo::launch_default_for_uri(&fallback, None::<&gio::AppLaunchContext>);
+                }
+            });
         });
         self.term.add_controller(click);
     }
