@@ -22,7 +22,9 @@ pub struct ClaudeRun {
 pub struct Tab {
     pub id: String,
     pub term: vte::Terminal,
-    pub page: gtk::ScrolledWindow,
+    pub page: gtk::Box,
+    search: gtk::SearchBar,
+    search_entry: gtk::SearchEntry,
     pub title: RefCell<String>,
     pub cwd: RefCell<String>,
     pub claude: RefCell<Option<ClaudeRun>>,
@@ -52,10 +54,13 @@ pub fn apply_theme(term: &vte::Terminal, dark: bool, in_panel: bool) {
     term.set_color_highlight(Some(&gdk::RGBA::new(r as f32, g as f32, b as f32, if dark { 0.35 } else { 0.24 })));
     term.set_color_highlight_foreground(None);
     term.set_font(Some(&crate::theme::mono_font()));
+    term.set_font_scale(crate::theme::term_scale());
 }
 
 const URL_RE: &str = r#"(https?|file)://[^\s<>"'`]+[^\s<>"'`.,;:!?)\]]"#;
 const PCRE2_MULTILINE: u32 = 0x0000_0400;
+const PCRE2_CASELESS: u32 = 0x0000_0008;
+const PCRE2_LITERAL: u32 = 0x0200_0000;
 
 impl Tab {
     pub fn new(cwd: &str, socket: &Path, cli: Option<&Path>) -> Rc<Tab> {
@@ -74,14 +79,22 @@ impl Tab {
         }
         apply_theme(&term, crate::widgets::is_dark(), true);
 
-        let page = gtk::ScrolledWindow::new();
-        page.set_hscrollbar_policy(gtk::PolicyType::Never);
-        page.set_child(Some(&term));
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+        scroller.set_child(Some(&term));
+        let search_entry = gtk::SearchEntry::builder().placeholder_text("Find in terminal").hexpand(true).build();
+        let search = gtk::SearchBar::builder().show_close_button(true).child(&search_entry).build();
+        search.connect_entry(&search_entry);
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        page.append(&search);
+        page.append(&scroller);
 
         let tab = Rc::new(Tab {
             id,
             term,
             page,
+            search,
+            search_entry,
             title: RefCell::new(String::new()),
             cwd: RefCell::new(cwd.to_string()),
             claude: RefCell::new(None),
@@ -94,8 +107,88 @@ impl Tab {
             exited: Cell::new(false),
         });
         tab.install_input_handlers();
+        tab.install_search();
+        tab.install_drop();
         tab.spawn(socket, cli);
         tab
+    }
+
+    /// Ctrl+Shift+F: find in the scrollback. Enter / Shift+Enter go to the next / previous match.
+    pub fn find(&self) {
+        self.search.set_search_mode(true);
+        self.search_entry.grab_focus();
+    }
+
+    fn install_search(self: &Rc<Self>) {
+        self.term.search_set_wrap_around(true);
+        let me = Rc::downgrade(self);
+        self.search_entry.connect_search_changed(move |e| {
+            let Some(t) = me.upgrade() else { return };
+            let q = e.text();
+            let re = (!q.is_empty())
+                .then(|| vte::Regex::for_search(&q, PCRE2_LITERAL | PCRE2_CASELESS | PCRE2_MULTILINE).ok())
+                .flatten();
+            t.term.search_set_regex(re.as_ref(), 0);
+            if re.is_some() {
+                t.term.unselect_all();
+                t.term.search_find_previous();
+            }
+        });
+        let me = Rc::downgrade(self);
+        self.search_entry.connect_activate(move |_| {
+            if let Some(t) = me.upgrade() {
+                t.term.search_find_previous();
+            }
+        });
+        let keys = gtk::EventControllerKey::new();
+        let me = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let Some(t) = me.upgrade() else { return glib::Propagation::Proceed };
+            if key == gdk::Key::Return || key == gdk::Key::KP_Enter {
+                if state.contains(gdk::ModifierType::SHIFT_MASK) {
+                    t.term.search_find_next();
+                } else {
+                    t.term.search_find_previous();
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.search_entry.add_controller(keys);
+        // Closing the bar hands the keyboard back to the terminal.
+        let me = Rc::downgrade(self);
+        self.search.connect_search_mode_enabled_notify(move |b| {
+            if let Some(t) = me.upgrade() {
+                if !b.is_search_mode() {
+                    t.term.search_set_regex(None, 0);
+                    t.term.grab_focus();
+                }
+            }
+        });
+    }
+
+    /// Dropping files or folders types their shell-quoted paths, like GNOME Terminal.
+    fn install_drop(self: &Rc<Self>) {
+        let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let me = Rc::downgrade(self);
+        target.connect_drop(move |_, value, _, _| {
+            let Some(t) = me.upgrade() else { return false };
+            let Ok(list) = value.get::<gdk::FileList>() else { return false };
+            let paths: Vec<String> = list
+                .files()
+                .iter()
+                .filter_map(|f| f.path())
+                .map(|p| claude_deck::accounts::shell_quote(&p.to_string_lossy()))
+                .collect();
+            if paths.is_empty() {
+                return false;
+            }
+            t.last_input.set(Instant::now());
+            t.term.feed_child(format!("{} ", paths.join(" ")).as_bytes());
+            t.term.grab_focus();
+            true
+        });
+        self.term.add_controller(target);
     }
 
     fn spawn(self: &Rc<Self>, socket: &Path, cli: Option<&Path>) {
@@ -135,9 +228,26 @@ impl Tab {
             let Some(tab) = me.upgrade() else { return glib::Propagation::Proceed };
             tab.last_input.set(Instant::now());
             let mods = state & (gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK);
+            if tab.exited.get() && (key == gdk::Key::Return || key == gdk::Key::KP_Enter) {
+                let _ = tab.term.activate_action("win.tab-close", Some(&tab.id.to_variant()));
+                return glib::Propagation::Stop;
+            }
             if (key == gdk::Key::Return || key == gdk::Key::KP_Enter) && mods == gdk::ModifierType::SHIFT_MASK {
                 tab.term.feed_child(b"\x1b\r");
                 return glib::Propagation::Stop;
+            }
+            // Zoom only here, so Ctrl +/- elsewhere (canvas, files) is left to that view.
+            if mods.contains(gdk::ModifierType::CONTROL_MASK) && !mods.contains(gdk::ModifierType::ALT_MASK) {
+                let action = match key {
+                    gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some("win.zoom-in"),
+                    gdk::Key::minus | gdk::Key::KP_Subtract => Some("win.zoom-out"),
+                    gdk::Key::_0 | gdk::Key::KP_0 => Some("win.zoom-reset"),
+                    _ => None,
+                };
+                if let Some(a) = action {
+                    let _ = tab.term.activate_action(a, None);
+                    return glib::Propagation::Stop;
+                }
             }
             glib::Propagation::Proceed
         });

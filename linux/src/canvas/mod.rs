@@ -48,6 +48,37 @@ struct Open {
     sid: String,
     name: String,
     mtime: i64,
+    /// The user clicked, typed or scrolled in it: an agent update waits behind a banner
+    /// instead of replacing what they were looking at or filling in.
+    touched: Rc<Cell<bool>>,
+}
+
+/// Note any interaction inside `w` without consuming it.
+fn track_touch(w: &gtk::Box) -> Rc<Cell<bool>> {
+    let t = Rc::new(Cell::new(false));
+    let click = gtk::GestureClick::new();
+    click.set_button(0);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let t1 = t.clone();
+    click.connect_pressed(move |_, _, _, _| t1.set(true));
+    w.add_controller(click);
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let t2 = t.clone();
+    keys.connect_key_pressed(move |_, _, _, _| {
+        t2.set(true);
+        gtk::glib::Propagation::Proceed
+    });
+    w.add_controller(keys);
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let t3 = t.clone();
+    scroll.connect_scroll(move |_, _, _| {
+        t3.set(true);
+        gtk::glib::Propagation::Proceed
+    });
+    w.add_controller(scroll);
+    t
 }
 
 pub struct CanvasPage {
@@ -481,7 +512,8 @@ impl CanvasPage {
         let Some(s) = self.session(sid) else { return };
         let (w, mtime) = self.build(&s, name);
         let holder = Self::holder_with(&w);
-        self.open.borrow_mut().push(Open { key: key.clone(), holder: holder.clone(), sid: sid.into(), name: name.into(), mtime });
+        let touched = track_touch(&holder);
+        self.open.borrow_mut().push(Open { key: key.clone(), holder: holder.clone(), sid: sid.into(), name: name.into(), mtime, touched });
         let project = if s.meta.project.is_empty() { crate::model::last_component(&s.meta.cwd) } else { s.meta.project.clone() };
         self.show(Shown {
             key,
@@ -495,11 +527,44 @@ impl CanvasPage {
     }
 
     fn reload(&self, sid: &str, name: &str) {
+        self.reload_with(sid, name, false);
+    }
+
+    fn reload_with(&self, sid: &str, name: &str, force: bool) {
         let Some(s) = self.session(sid) else { return };
+        if !force {
+            let mut open = self.open.borrow_mut();
+            let Some(o) = open.iter_mut().find(|o| o.sid == sid && o.name == name) else { return };
+            if o.touched.get() {
+                let mtime = s.items.iter().find(|i| i.name == name).map(|i| i.mtime).unwrap_or(o.mtime);
+                o.mtime = mtime; // don't ask again until the next update
+                if !o.holder.first_child().is_some_and(|c| c.is::<adw::Banner>()) {
+                    let banner = adw::Banner::builder()
+                        .title("The agent updated this screen")
+                        .button_label("Reload")
+                        .revealed(true)
+                        .build();
+                    let (me, sid2, name2) = (self.me.borrow().clone(), sid.to_string(), name.to_string());
+                    banner.connect_button_clicked(move |_| {
+                        if let Some(me) = me.upgrade() {
+                            me.reload_with(&sid2, &name2, true);
+                        }
+                    });
+                    o.holder.prepend(&banner);
+                }
+                let key = o.key.clone();
+                drop(open);
+                if let Some(f) = self.on_changed.borrow().clone() {
+                    f(&key);
+                }
+                return;
+            }
+        }
         let (w, mtime) = self.build(&s, name);
         let key = {
             let mut open = self.open.borrow_mut();
             let Some(o) = open.iter_mut().find(|o| o.sid == sid && o.name == name) else { return };
+            o.touched.set(false);
             while let Some(c) = o.holder.first_child() {
                 o.holder.remove(&c);
             }
@@ -529,7 +594,7 @@ impl CanvasPage {
         }
         let holder = Self::holder_with(&w);
         let title = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
-        self.open.borrow_mut().push(Open { key: key.clone(), holder: holder.clone(), sid: String::new(), name: title.clone(), mtime: 0 });
+        self.open.borrow_mut().push(Open { key: key.clone(), holder: holder.clone(), sid: String::new(), name: title.clone(), mtime: 0, touched: Rc::new(Cell::new(false)) });
         let crumb = path
             .to_string_lossy()
             .replace(&claude_deck::config::home().to_string_lossy().to_string(), "~")
@@ -556,7 +621,7 @@ impl CanvasPage {
         }
         let w = gitview::changes(dir.to_path_buf());
         let holder = Self::holder_with(&w);
-        self.open.borrow_mut().push(Open { key: key.clone(), holder: holder.clone(), sid: String::new(), name: String::new(), mtime: 0 });
+        self.open.borrow_mut().push(Open { key: key.clone(), holder: holder.clone(), sid: String::new(), name: String::new(), mtime: 0, touched: Rc::new(Cell::new(false)) });
         self.show(Shown {
             key,
             title: format!("Changes · {title}"),

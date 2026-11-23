@@ -81,6 +81,7 @@ impl AccountInfo {
             Usage::Ok { .. } => "Ready".into(),
             Usage::Unknown => "Checking usage…".into(),
             Usage::NotLoggedIn => "Not logged in".into(),
+            Usage::NoData => "Usage shows once a session runs on it".into(),
             Usage::Expired => "Refreshes on next use".into(),
             Usage::Error(e) => format!("Couldn't read usage: {e}"),
         }

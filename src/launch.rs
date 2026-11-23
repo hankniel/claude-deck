@@ -92,10 +92,9 @@ pub fn run(cfg: &Config, account: Option<String>, args: Vec<String>) -> Result<i
     let user_args = args.clone();
     let mut start_args = start_args_for_new(&user_args);
     loop {
-        accounts::link_shared(&acc, cfg)?;
         let (session_id, args) = start_args;
         let started = SystemTime::now();
-        let mut child = spawn(cfg, &acc, &args)?;
+        let mut child = spawn(cfg, &acc, &cwd, &args)?;
         if let Some(l) = link.as_mut() {
             l.send(json!({"type":"started","account":acc.name,"session_id":session_id,"cwd":cwd}));
         }
@@ -206,9 +205,9 @@ fn resume_args(session: Option<&str>, user: &[String]) -> Vec<String> {
     out
 }
 
-fn spawn(cfg: &Config, acc: &Account, args: &[String]) -> Result<Child> {
+fn spawn(cfg: &Config, acc: &Account, cwd: &Path, args: &[String]) -> Result<Child> {
     let mut c = Command::new(&cfg.claude_bin);
-    c.args(args);
+    c.args(acc.claude_args(cwd, args));
     acc.apply_env(&mut c);
     c.spawn().with_context(|| format!("starting {}", cfg.claude_bin))
 }

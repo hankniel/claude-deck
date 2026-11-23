@@ -234,6 +234,15 @@ pub fn mono_font() -> gtk::pango::FontDescription {
     gtk::pango::FontDescription::from_string(&font("mono").unwrap_or_else(|| "JetBrains Mono, Ubuntu Mono, monospace 11".into()))
 }
 
+/// Ctrl +/- zoom of every terminal, remembered across tabs and restarts.
+pub fn term_scale() -> f64 {
+    prefs::get("font.term_scale").and_then(|s| s.parse().ok()).filter(|s: &f64| s.is_finite()).unwrap_or(1.0).clamp(0.5, 3.0)
+}
+
+pub fn set_term_scale(scale: f64) {
+    prefs::set("font.term_scale", &format!("{:.4}", scale.clamp(0.5, 3.0)));
+}
+
 pub fn set_font(kind: &str, desc: Option<&str>) {
     prefs::set(&format!("font.{kind}"), desc.unwrap_or(""));
     apply_fonts();

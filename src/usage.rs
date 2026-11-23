@@ -27,6 +27,8 @@ pub enum Usage {
     Unknown,
     Ok { five: Option<Window>, week: Option<Window>, others: Vec<Window>, plan: Option<String> },
     NotLoggedIn,
+    /// A token account none of whose sessions has reported usage yet.
+    NoData,
     /// Token expired: Claude Code refreshes it on its next request in that account.
     Expired,
     Error(String),
@@ -54,6 +56,7 @@ impl Usage {
             Usage::Unknown => "loading…",
             Usage::Ok { .. } => "ok",
             Usage::NotLoggedIn => "not logged in",
+            Usage::NoData => "no usage yet",
             Usage::Expired => "token expired",
             Usage::Error(_) => "error",
         }
@@ -61,6 +64,12 @@ impl Usage {
 }
 
 pub fn fetch(acc: &Account) -> Usage {
+    if !acc.is_default() {
+        if acc.token().is_none() {
+            return Usage::NotLoggedIn;
+        }
+        return live(&acc.name).unwrap_or(Usage::NoData);
+    }
     let oauth = match acc.oauth() {
         Ok(Some(o)) => o,
         Ok(None) => return Usage::NotLoggedIn,
@@ -136,6 +145,59 @@ fn parse(body: &serde_json::Value, plan: Option<String>) -> Usage {
     Usage::Ok { five, week, others, plan }
 }
 
+/// Token accounts can't call the usage endpoint; their sessions' status line saves the
+/// rate limits Claude Code reads from its own API responses here instead.
+pub fn live_path(account: &str) -> std::path::PathBuf {
+    crate::config::data_dir().join("usage-live").join(format!("{account}.json"))
+}
+
+/// Save the `rate_limits` of a status line payload for `account`.
+pub fn record_live(account: &str, status: &serde_json::Value) -> std::io::Result<()> {
+    let Some(rl) = status.get("rate_limits").filter(|r| r.is_object()) else { return Ok(()) };
+    let p = live_path(account);
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let tmp = p.with_extension(format!("json.{}", std::process::id()));
+    std::fs::write(&tmp, serde_json::json!({ "at": Utc::now().timestamp(), "rate_limits": rl }).to_string())?;
+    std::fs::rename(tmp, p)
+}
+
+/// Session id -> account, for stats: token sessions' transcripts carry no account id.
+pub fn session_accounts_dir() -> std::path::PathBuf {
+    crate::config::data_dir().join("session-accounts")
+}
+
+pub fn record_session_account(session: &str, account: &str) -> std::io::Result<()> {
+    if session.is_empty() || session.contains('/') {
+        return Ok(());
+    }
+    let p = session_accounts_dir().join(session);
+    if std::fs::read_to_string(&p).is_ok_and(|a| a == account) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(session_accounts_dir())?;
+    std::fs::write(p, account)
+}
+
+fn live(account: &str) -> Option<Usage> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(live_path(account)).ok()?).ok()?;
+    Some(parse_live(v.get("rate_limits")?))
+}
+
+/// `{"five_hour": {"used_percentage": 12, "resets_at": <unix secs>}, "seven_day": {...}}`
+fn parse_live(rl: &serde_json::Value) -> Usage {
+    let win = |k: &str| {
+        let w = rl.get(k)?;
+        Some(Window {
+            name: k.to_string(),
+            pct: w.get("used_percentage")?.as_f64()?,
+            resets_at: w.get("resets_at").and_then(|r| r.as_i64()).and_then(|t| DateTime::from_timestamp(t, 0)),
+        })
+    };
+    Usage::Ok { five: win("five_hour"), week: win("seven_day"), others: vec![], plan: None }
+}
+
 /// "2h13m", "3d4h", "12m".
 pub fn until(t: DateTime<Utc>) -> String {
     let secs = (t - Utc::now()).num_seconds().max(0);
@@ -165,6 +227,19 @@ mod tests {
         assert_eq!(five.unwrap().pct, 42.0);
         assert_eq!(week.unwrap().pct, 61.5);
         assert_eq!(others.len(), 1);
+    }
+
+    #[test]
+    fn parses_status_line_limits() {
+        let v = serde_json::json!({
+            "five_hour": {"used_percentage": 7, "resets_at": 4102444800i64},
+            "seven_day": {"used_percentage": 33.5, "resets_at": 4102444800i64}
+        });
+        let Usage::Ok { five, week, .. } = parse_live(&v) else { panic!() };
+        assert_eq!(five.unwrap().pct, 7.0);
+        let w = week.unwrap();
+        assert_eq!(w.pct, 33.5);
+        assert!(w.resets_at.is_some());
     }
 
     #[test]

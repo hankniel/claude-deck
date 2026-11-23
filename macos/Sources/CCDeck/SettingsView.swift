@@ -115,7 +115,7 @@ struct AccountsSettings: View {
                     .padding(.vertical, 2)
                 }
             } header: { Text("Accounts") } footer: {
-                Text("`default` is your usual ~/.claude login. Other accounts are separate Claude Code profiles that share your settings, skills and history.")
+                Text("`default` is your usual ~/.claude login. Other accounts are sign-in tokens: their sessions run on the same ~/.claude, so settings, skills, plugins, MCP and history are shared.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -124,7 +124,7 @@ struct AccountsSettings: View {
                     TextField("Name, e.g. personal", text: $newName)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(add)
-                    Button("Add and log in", action: add)
+                    Button("Add and sign in", action: add)
                         .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             } header: { Text("Add an account") }
@@ -140,27 +140,21 @@ struct AccountsSettings: View {
                 }
             }
         } message: {
-            Text("Deletes the profile and its stored login. Shared settings, skills and history stay.")
+            Text("Deletes its stored token. Your ~/.claude settings, skills and history are not touched.")
         }
     }
 
     private func add() {
         let name = newName.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return }
-        Task {
-            do {
-                try await DeckCLI.add(name)
-                newName = ""
-                await state.refresh()
-                login(name)
-            } catch {
-                state.flash(error.localizedDescription)
-            }
-        }
+        newName = ""
+        login(name)
     }
 
+    /// `default` logs in with /login; other accounts get a new token from `claude-deck add`.
     private func login(_ name: String) {
-        state.newTab(cwd: NSHomeDirectory(), run: "claude-deck launch --account \(name)")
+        let run = name == "default" ? "env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude" : "claude-deck add \(name)"
+        state.newTab(cwd: NSHomeDirectory(), run: run)
         openWindow(id: "main")
         NSApp.activate(ignoringOtherApps: true)
     }

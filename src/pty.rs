@@ -59,18 +59,19 @@ pub fn spawn_claude(
     };
 
     let mut cmd = CommandBuilder::new(&cfg.claude_bin);
-    cmd.args(&args);
+    cmd.args(acc.claude_args(cwd, &args));
     cmd.cwd(cwd);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    cmd.env("CLAUDE_DECK_ACCOUNT", &acc.name);
     if std::env::var_os("LANG").is_none() {
         cmd.env("LANG", "en_US.UTF-8");
     }
     cmd.env_remove("TMUX");
-    match &acc.config_dir {
-        Some(d) => cmd.env("CLAUDE_CONFIG_DIR", d),
-        None => cmd.env_remove("CLAUDE_CONFIG_DIR"),
+    for (k, v) in acc.env() {
+        match v {
+            Some(v) => cmd.env(k, v),
+            None => cmd.env_remove(k),
+        }
     }
     let child = pair
         .slave

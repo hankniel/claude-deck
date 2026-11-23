@@ -480,7 +480,20 @@ pub fn file(path: &Path, line: Option<u32>, on_open: OpenFn) -> gtk::Widget {
     if md.len() > 4 * 1024 * 1024 {
         return error_page(&format!("{} is larger than 4 MB", path.display()));
     }
+    let ext_lc = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if matches!(ext_lc.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico") {
+        let pic = gtk::Picture::for_filename(path);
+        pic.set_content_fit(gtk::ContentFit::ScaleDown);
+        pic.set_can_shrink(true);
+        pic.set_vexpand(true);
+        return with_file_header(path, pic.upcast());
+    }
     let bytes = std::fs::read(path).unwrap_or_default();
+    if bytes.iter().take(8192).any(|b| *b == 0) {
+        let l = label("Binary file: open it with the default app (button above).", &["dim-label"]);
+        l.set_vexpand(true);
+        return with_file_header(path, l.upcast());
+    }
     let text = String::from_utf8_lossy(&bytes).to_string();
     let buf = gtk::TextBuffer::new(None);
     buf.set_text(&text);
@@ -494,6 +507,29 @@ pub fn file(path: &Path, line: Option<u32>, on_open: OpenFn) -> gtk::Widget {
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_vexpand(true);
     scroll.set_child(Some(&view));
+    // Follow edits on disk (Claude changing the file), keeping the scroll position.
+    if let Ok(mon) = gio::File::for_path(path).monitor_file(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE) {
+        // Weak refs: the view owns the monitor, not the other way round.
+        let (p, b, sc) = (path.to_path_buf(), buf.downgrade(), scroll.downgrade());
+        mon.connect_changed(move |_, _, _, ev| {
+            if !matches!(ev, gio::FileMonitorEvent::ChangesDoneHint | gio::FileMonitorEvent::Created | gio::FileMonitorEvent::MovedIn | gio::FileMonitorEvent::Renamed) {
+                return;
+            }
+            let (Some(b), Some(sc)) = (b.upgrade(), sc.upgrade()) else { return };
+            let Ok(bytes) = std::fs::read(&p) else { return };
+            if bytes.len() > 4 * 1024 * 1024 {
+                return;
+            }
+            let adj = sc.vadjustment();
+            let v = adj.value();
+            b.set_text(&String::from_utf8_lossy(&bytes));
+            glib::idle_add_local_once(move || adj.set_value(v.min(adj.upper() - adj.page_size()).max(0.0)));
+        });
+        // The closure owns the monitor: it lives, and stops, with the view.
+        scroll.connect_destroy(move |_| {
+            mon.cancel();
+        });
+    }
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     head.set_margin_start(16);
     head.set_margin_end(10);
@@ -529,6 +565,34 @@ pub fn file(path: &Path, line: Option<u32>, on_open: OpenFn) -> gtk::Widget {
             });
         }
     }
+    root.upcast()
+}
+
+/// A file's path and "open with the default app" above `body` (images, binary files).
+fn with_file_header(path: &Path, body: gtk::Widget) -> gtk::Widget {
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    head.set_margin_start(16);
+    head.set_margin_end(10);
+    head.set_margin_top(6);
+    head.set_margin_bottom(6);
+    let title = label(&crate::model::short_path(&path.to_string_lossy()), &["dim-label", "caption"]);
+    title.set_hexpand(true);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::Start);
+    head.append(&title);
+    let ext = gtk::Button::from_icon_name("document-open-symbolic");
+    ext.add_css_class("flat");
+    ext.set_tooltip_text(Some("Open with the default app"));
+    let file = gio::File::for_path(path);
+    ext.connect_clicked(move |b| {
+        let win = b.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+        gtk::FileLauncher::new(Some(&file)).launch(win.as_ref(), None::<&gio::Cancellable>, |_| {});
+    });
+    head.append(&ext);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&head);
+    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    body.set_margin_top(12);
+    root.append(&body);
     root.upcast()
 }
 

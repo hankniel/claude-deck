@@ -160,10 +160,7 @@ fn parse_line(line: &str) -> Option<(String, Rec)> {
 }
 
 fn transcript_files(cutoff: SystemTime) -> Vec<PathBuf> {
-    let mut roots = vec![default_claude_dir().join("projects")];
-    for a in accounts::list() {
-        roots.push(a.dir().join("projects"));
-    }
+    let roots = vec![default_claude_dir().join("projects")];
     let mut seen = HashSet::new();
     let mut out = vec![];
     fn walk(dir: &Path, depth: usize, cutoff: SystemTime, out: &mut Vec<PathBuf>) {
@@ -285,12 +282,16 @@ pub fn compute(days: u32) -> Result<Stats> {
     let cutoff = SystemTime::now() - Duration::from_secs(days as u64 * 86400 + 86400);
 
     // accountUuid -> account name; session id -> account (from our own start/switch events).
-    let uuid_names: HashMap<String, String> = accounts::list()
-        .into_iter()
-        .filter_map(|a| Some((a.account_uuid()?, a.name)))
-        .collect();
+    let mut uuid_names = accounts::legacy_uuids();
+    uuid_names.extend(accounts::list().into_iter().filter_map(|a| Some((a.account_uuid()?, a.name))));
     let events = read_jsonl(&events_path(), since - chrono::Duration::days(30));
-    let mut session_acc: HashMap<String, String> = HashMap::new();
+    let mut session_acc: HashMap<String, String> = std::fs::read_dir(crate::usage::session_accounts_dir())
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| Some((e.file_name().into_string().ok()?, std::fs::read_to_string(e.path()).ok()?)))
+                .collect()
+        })
+        .unwrap_or_default();
     for e in &events {
         if let (Some(s), Some(a)) = (e.get("session_id").and_then(|x| x.as_str()), e.get("account").and_then(|x| x.as_str())) {
             session_acc.insert(s.to_string(), a.to_string());

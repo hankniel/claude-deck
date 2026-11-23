@@ -30,14 +30,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create an account profile and log in to it.
+    /// Add an account (or renew its token): runs `claude setup-token`, then asks for the token.
     Add {
         name: String,
-        /// Create the profile without launching claude to log in.
+        /// Use this token instead of running `claude setup-token` (`-` reads it from stdin).
         #[arg(long)]
-        no_login: bool,
+        token: Option<String>,
     },
-    /// Remove an account profile and its stored login.
+    /// Remove an account and its stored token.
     Rm { name: String },
     /// Show every account with its usage.
     #[command(alias = "ls")]
@@ -55,14 +55,15 @@ enum Cmd {
     Unmap { dir: Option<PathBuf> },
     /// List directory mappings.
     Maps,
-    /// Print `export CLAUDE_CONFIG_DIR=...` for an account (eval it in a shell).
+    /// Print the shell exports that put claude on an account (eval it in a shell).
     Env { name: String },
     /// Exclude an account from automatic choices.
     Disable { name: String },
     /// Put a disabled account back into automatic choices.
     Enable { name: String },
-    /// Recreate the shared ~/.claude symlinks in every profile.
-    Link,
+    /// Status line command of CC Deck sessions: records the account's usage, then runs yours.
+    #[command(hide = true)]
+    Statusline,
     /// Show settings, or set one: `config threshold 80`.
     Config { key: Option<String>, value: Option<String> },
     /// Run claude on a chosen account and keep it movable (used by the shell `claude` function).
@@ -100,22 +101,7 @@ fn main() -> Result<()> {
     let mut cfg = Config::load()?;
     match cli.cmd {
         None => tui::run(cfg, tui::Options { account: cli.account, claude_args: cli.claude_args }),
-        Some(Cmd::Add { name, no_login }) => {
-            let acc = accounts::create(&name, &cfg)?;
-            println!("created {} at {}", acc.name, acc.dir().display());
-            if no_login {
-                return Ok(());
-            }
-            println!("launching claude for {name}: log in, then exit with /exit");
-            let mut c = Command::new(&cfg.claude_bin);
-            acc.apply_env(&mut c);
-            c.status().context("running claude")?;
-            match acc.email() {
-                Some(e) => println!("{name} is logged in as {e}"),
-                None => println!("{name} has no login yet; run `claude-deck run {name}` and use /login"),
-            }
-            Ok(())
-        }
+        Some(Cmd::Add { name, token }) => add(&cfg, &name, token),
         Some(Cmd::Rm { name }) => {
             accounts::remove(&name)?;
             cfg.maps.retain(|_, a| a != &name);
@@ -146,9 +132,8 @@ fn main() -> Result<()> {
                 None => prompt_account()?,
             };
             let acc = accounts::find(&name)?;
-            accounts::link_shared(&acc, &cfg)?;
             let mut c = Command::new(&cfg.claude_bin);
-            c.args(&args);
+            c.args(acc.claude_args(&cwd, &args));
             acc.apply_env(&mut c);
             Err(c.exec()).context("starting claude")
         }
@@ -180,9 +165,11 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Env { name }) => {
             let acc = accounts::find(&name)?;
-            match &acc.config_dir {
-                Some(d) => println!("export CLAUDE_CONFIG_DIR={}", shell_quote(&d.to_string_lossy())),
-                None => println!("unset CLAUDE_CONFIG_DIR"),
+            for (k, v) in acc.env() {
+                match v {
+                    Some(v) => println!("export {k}={}", accounts::shell_quote(&v)),
+                    None => println!("unset {k}"),
+                }
             }
             Ok(())
         }
@@ -201,15 +188,7 @@ fn main() -> Result<()> {
             println!("{name} enabled");
             Ok(())
         }
-        Some(Cmd::Link) => {
-            for acc in accounts::list() {
-                for c in accounts::link_shared(&acc, &cfg)? {
-                    println!("{}: {c} exists in the profile, left as is", acc.name);
-                }
-            }
-            println!("links up to date");
-            Ok(())
-        }
+        Some(Cmd::Statusline) => statusline(),
         Some(Cmd::Config { key, value }) => {
             match (key, value) {
                 (Some(k), Some(v)) => {
@@ -300,6 +279,7 @@ fn state_json(cfg: &Config, record: bool) -> Result<()> {
             ),
             Usage::Unknown => ("loading", None, json!(null), json!(null), vec![], None),
             Usage::NotLoggedIn => ("logged_out", None, json!(null), json!(null), vec![], None),
+            Usage::NoData => ("no_data", None, json!(null), json!(null), vec![], None),
             Usage::Expired => ("expired", None, json!(null), json!(null), vec![], None),
             Usage::Error(e) => ("error", Some(e.clone()), json!(null), json!(null), vec![], None),
         };
@@ -376,7 +356,93 @@ fn abs_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
     d.canonicalize().with_context(|| format!("{} does not exist", d.display()))
 }
 
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+fn add(cfg: &Config, name: &str, token: Option<String>) -> Result<()> {
+    accounts::valid_name(name)?;
+    if name == accounts::DEFAULT {
+        bail!("`default` is your ~/.claude login; log in there with `claude` and /login");
+    }
+    let raw = match token.as_deref() {
+        Some("-") => {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+            s
+        }
+        Some(t) => t.to_string(),
+        None => {
+            println!("Sign in to the account for {name:?} in the browser; claude prints a token.");
+            println!("Already signed in to another account there? Switch accounts in the browser first.\n");
+            let st = Command::new(&cfg.claude_bin)
+                .arg("setup-token")
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+                .status()
+                .context("running claude setup-token")?;
+            if !st.success() {
+                bail!("claude setup-token did not finish");
+            }
+            read_hidden("\nPaste the token (hidden): ")?
+        }
+    };
+    let tok = accounts::clean_token(&raw)?;
+    match accounts::check_token(&tok) {
+        accounts::TokenCheck::Valid => {}
+        accounts::TokenCheck::Rejected => bail!("Claude rejected that token; nothing was saved"),
+        accounts::TokenCheck::Unknown(e) => eprintln!("warning: couldn't check the token ({e}); saving it anyway"),
+    }
+    let renewed = accounts::find(name).is_ok();
+    accounts::save(name, &tok)?;
+    claude_deck::stats::log_event("account", Some(name), if renewed { "token renewed" } else { "account added" }, serde_json::json!({}));
+    println!("{name} is ready: choose it when you start claude. Usage shows once a session runs on it.");
+    Ok(())
+}
+
+fn read_hidden(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if tty {
+        let _ = Command::new("stty").arg("-echo").status();
+    }
+    let mut line = String::new();
+    let r = std::io::stdin().lock().read_line(&mut line);
+    if tty {
+        let _ = Command::new("stty").arg("echo").status();
+        eprintln!();
+    }
+    r?;
+    Ok(line)
+}
+
+/// Save the session's rate limits for its account, then hand the same input to the user's own
+/// status line and pass its output through.
+fn statusline() -> Result<()> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let v: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+    if let Ok(acc) = std::env::var("CLAUDE_DECK_ACCOUNT") {
+        let _ = usage::record_live(&acc, &v);
+        if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
+            let _ = usage::record_session_account(s, &acc);
+        }
+    }
+    let cwd = v
+        .pointer("/workspace/project_dir")
+        .or_else(|| v.get("cwd"))
+        .and_then(|c| c.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let Some(cmd) = accounts::user_statusline(&cwd).and_then(|s| s.get("command")?.as_str().map(String::from)) else {
+        return Ok(());
+    };
+    let mut child = Command::new("sh")
+        .args(["-c", &cmd])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("running your status line")?;
+    if let Some(mut sin) = child.stdin.take() {
+        let _ = sin.write_all(input.as_bytes());
+    }
+    let st = child.wait()?;
+    std::process::exit(st.code().unwrap_or(1));
 }
 

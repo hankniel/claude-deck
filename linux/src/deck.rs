@@ -465,6 +465,8 @@ impl Deck {
         let term_model = gio::Menu::new();
         term_model.append(Some("Copy"), Some("win.copy"));
         term_model.append(Some("Paste"), Some("win.paste"));
+        term_model.append(Some("Select All"), Some("win.select-all"));
+        term_model.append(Some("Find…"), Some("win.find"));
         let term_menu = gtk::PopoverMenu::from_model(Some(&term_model));
         term_menu.set_parent(&wb.root);
         term_menu.set_has_arrow(false);
@@ -556,6 +558,21 @@ impl Deck {
             }
             glib::ControlFlow::Continue
         });
+
+        // `claude-deck add` runs in a terminal tab; show the account as soon as its token lands.
+        let tokens = accounts::tokens_dir();
+        let _ = std::fs::create_dir_all(&tokens);
+        if let Ok(m) = gio::File::for_path(&tokens).monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
+            let d = Rc::downgrade(&deck);
+            m.connect_changed(move |_, _, _, ev| {
+                if matches!(ev, gio::FileMonitorEvent::ChangesDoneHint | gio::FileMonitorEvent::Deleted | gio::FileMonitorEvent::MovedIn | gio::FileMonitorEvent::Renamed) {
+                    if let Some(d) = d.upgrade() {
+                        d.refresh(false);
+                    }
+                }
+            });
+            std::mem::forget(m); // lives as long as the app
+        }
 
         deck.rebuild_accounts();
         let panel_was_shown = deck.wb.panel_shown();
@@ -768,15 +785,25 @@ impl Deck {
         add("refresh", Box::new(|d| d.refresh(false)));
         add("next-tab", Box::new(|d| d.cycle(1)));
         add("prev-tab", Box::new(|d| d.cycle(-1)));
-        add("copy", Box::new(|d| {
-            if let Some(t) = d.active_tab() {
-                t.term.copy_clipboard_format(vte::Format::Text);
-            }
+        // Copy/paste follow the focus: a terminal, else the focused text (file view, note, label).
+        add("copy", Box::new(|d| match d.focused_tab() {
+            Some(t) => t.term.copy_clipboard_format(vte::Format::Text),
+            None => d.focus_action("clipboard.copy"),
         }));
-        add("paste", Box::new(|d| {
-            if let Some(t) = d.active_tab() {
+        add("paste", Box::new(|d| match d.focused_tab() {
+            Some(t) => {
                 t.last_input.set(Instant::now());
                 vte::prelude::TerminalExt::paste_clipboard(&t.term);
+            }
+            None => d.focus_action("clipboard.paste"),
+        }));
+        add("select-all", Box::new(|d| match d.focused_tab() {
+            Some(t) => t.term.select_all(),
+            None => d.focus_action("selection.select-all"),
+        }));
+        add("find", Box::new(|d| {
+            if let Some(t) = d.focused_tab().or_else(|| d.active_tab()) {
+                t.find();
             }
         }));
         add("zoom-in", Box::new(|d| d.zoom(Some(1.1))));
@@ -852,10 +879,8 @@ impl Deck {
             ("win.next-tab", &["<Ctrl>Page_Down", "<Ctrl><Shift>bracketright"]),
             ("win.prev-tab", &["<Ctrl>Page_Up", "<Ctrl><Shift>bracketleft"]),
             ("win.copy", &["<Ctrl><Shift>c"]),
+            ("win.find", &["<Ctrl><Shift>f"]),
             ("win.paste", &["<Ctrl><Shift>v"]),
-            ("win.zoom-in", &["<Ctrl>plus", "<Ctrl>equal", "<Ctrl>KP_Add"]),
-            ("win.zoom-out", &["<Ctrl>minus", "<Ctrl>KP_Subtract"]),
-            ("win.zoom-reset", &["<Ctrl>0"]),
             ("win.toggle-sidebar", &["F9", "<Ctrl><Shift>b"]),
             ("win.toggle-panel", &["<Ctrl>grave"]),
             ("win.settings", &["<Ctrl>comma"]),
@@ -876,6 +901,24 @@ impl Deck {
         self.tabs.borrow().iter().find(|t| t.id == id).cloned()
     }
 
+    /// The terminal that has keyboard focus, if any.
+    fn focused_tab(&self) -> Option<Rc<Tab>> {
+        let mut w = gtk::prelude::GtkWindowExt::focus(&self.window);
+        while let Some(x) = w {
+            if let Ok(term) = x.clone().downcast::<vte::Terminal>() {
+                return self.tabs.borrow().iter().find(|t| t.term == term).cloned();
+            }
+            w = x.parent();
+        }
+        None
+    }
+
+    fn focus_action(&self, name: &str) {
+        if let Some(w) = gtk::prelude::GtkWindowExt::focus(&self.window) {
+            let _ = w.activate_action(name, None);
+        }
+    }
+
     /// The terminal last selected (in any group).
     pub fn active_tab(&self) -> Option<Rc<Tab>> {
         let id = self.active_term.borrow().clone();
@@ -892,13 +935,24 @@ impl Deck {
 
         let d = Rc::downgrade(self);
         let tid = id.clone();
-        tab.term.connect_child_exited(move |_, _| {
+        tab.term.connect_child_exited(move |_, status| {
             let Some(d) = d.upgrade() else { return };
-            if let Some(t) = d.tab(&tid) {
-                t.exited.set(true);
+            let Some(t) = d.tab(&tid) else { return };
+            t.exited.set(true);
+            // A clean exit closes the tab; otherwise keep it so the error stays readable.
+            if status == 0 {
+                let tid = tid.clone();
+                glib::idle_add_local_once(move || d.close_tab(&tid));
+                return;
             }
-            let tid = tid.clone();
-            glib::idle_add_local_once(move || d.close_tab(&tid));
+            let why = if libc::WIFEXITED(status) {
+                format!("exited with code {}", libc::WEXITSTATUS(status))
+            } else if libc::WIFSIGNALED(status) {
+                format!("was stopped by signal {}", libc::WTERMSIG(status))
+            } else {
+                format!("ended (status {status})")
+            };
+            t.term.feed(format!("\r\n\x1b[2m[the shell {why} — press Enter to close this tab]\x1b[0m\r\n").as_bytes());
         });
         let d = Rc::downgrade(self);
         let t = Rc::downgrade(&tab);
@@ -925,6 +979,8 @@ impl Deck {
         click.connect_pressed(move |g, _, x, y| {
             let Some(d) = d.upgrade() else { return };
             let Some(w) = g.widget() else { return };
+            // The menu acts on the focused terminal: make that the one clicked.
+            w.grab_focus();
             let p = w
                 .compute_point(&d.wb.root, &gtk::graphene::Point::new(x as f32, y as f32))
                 .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
@@ -995,9 +1051,11 @@ impl Deck {
         self.select_index(((cur + delta + n) % n) as usize);
     }
 
+    /// One zoom level for all terminals, so a new tab opens at the same size.
     fn zoom(&self, factor: Option<f64>) {
+        let s = factor.map(|f| (crate::theme::term_scale() * f).clamp(0.5, 3.0)).unwrap_or(1.0);
+        crate::theme::set_term_scale(s);
         for t in self.tabs.borrow().iter() {
-            let s = factor.map(|f| (t.term.font_scale() * f).clamp(0.5, 3.0)).unwrap_or(1.0);
             t.term.set_font_scale(s);
         }
     }
@@ -1516,13 +1574,12 @@ impl Deck {
         self.after_state_change();
     }
 
+    /// Check the name; the account itself appears once `login` has stored its token.
     pub fn add_account(self: &Rc<Self>, name: &str) -> Result<(), String> {
-        let cfg = self.config.borrow().clone();
-        accounts::create(name, &cfg).map_err(|e| format!("{e:#}"))?;
-        let (accs, _) = model::quick_state();
-        *self.accounts.borrow_mut() = accs;
-        self.after_state_change();
-        self.refresh(false);
+        accounts::valid_name(name).map_err(|e| format!("{e:#}"))?;
+        if name == accounts::DEFAULT || self.accounts.borrow().iter().any(|a| a.name == name) {
+            return Err(format!("{name} already exists"));
+        }
         Ok(())
     }
 
@@ -1541,18 +1598,17 @@ impl Deck {
         self.toast(&format!("Removed {name}"));
     }
 
-    /// Open a tab that runs claude on `name` so the user can /login.
+    /// Open a tab that signs `name` in: /login for `default`, a new token for the others.
     pub fn login(self: &Rc<Self>, name: &str) {
-        let cmd = match &self.cli {
-            Some(_) => format!("\"$CC_DECK_BIN\" launch --account {name}"),
-            None => match accounts::find(name).ok().and_then(|a| a.config_dir) {
-                Some(dir) => format!("CLAUDE_CONFIG_DIR='{}' command claude", dir.display()),
-                None => "env -u CLAUDE_CONFIG_DIR claude".into(),
-            },
+        let bin = if self.cli.is_some() { "\"$CC_DECK_BIN\"" } else { "claude-deck" };
+        let (cmd, hint) = if name == accounts::DEFAULT {
+            ("env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude".to_string(), format!("Log in to {name} with /login, then keep working or /exit"))
+        } else {
+            (format!("{bin} add {name}"), format!("Sign in to {name} in the browser, then paste the token"))
         };
         self.new_tab(Some(home().to_string_lossy().to_string()), Some(cmd));
         self.window.present();
-        self.toast(&format!("Log in to {name} with /login, then keep working or /exit"));
+        self.toast(&hint);
     }
 
     pub fn map_dir(self: &Rc<Self>, account: &str, dir: &Path) {

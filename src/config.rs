@@ -18,11 +18,12 @@ pub fn config_dir() -> PathBuf {
     xdg("XDG_CONFIG_HOME", ".config").join("claude-deck")
 }
 
-/// Where profiles, usage history and the event log live.
+/// Where account tokens, usage history and the event log live.
 pub fn data_dir() -> PathBuf {
     xdg("XDG_DATA_HOME", ".local/share").join("claude-deck")
 }
 
+/// Per-account config dirs made by older versions; only read to attribute old sessions.
 pub fn profiles_dir() -> PathBuf {
     data_dir().join("profiles")
 }
@@ -49,8 +50,6 @@ pub struct Config {
     pub poll_secs: u64,
     /// The Claude Code executable.
     pub claude_bin: String,
-    /// Items under ~/.claude that every profile symlinks to (settings, skills, history...).
-    pub shared: Vec<String>,
     /// Accounts never chosen automatically.
     pub disabled: Vec<String>,
     /// Directory -> account. Subdirectories inherit the nearest mapped ancestor.
@@ -69,23 +68,6 @@ impl Default for Config {
             cooldown_secs: 300,
             poll_secs: 120,
             claude_bin: "claude".into(),
-            shared: [
-                "settings.json",
-                "CLAUDE.md",
-                "skills",
-                "agents",
-                "commands",
-                "plugins",
-                "hooks",
-                "output-styles",
-                "keybindings.json",
-                "projects",
-                "history.jsonl",
-                "todos",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
             disabled: vec![],
             maps: BTreeMap::new(),
             recent: vec![],

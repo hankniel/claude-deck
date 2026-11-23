@@ -67,9 +67,6 @@ struct App {
 
 pub fn run(cfg: Config, opts: Options) -> Result<()> {
     let accounts = accounts::list();
-    for a in &accounts {
-        let _ = accounts::link_shared(a, &cfg);
-    }
     let dirty = Arc::new(AtomicBool::new(true));
     let (usage_tx, usage_rx) = mpsc::channel();
     let (refresh_tx, refresh_rx) = mpsc::channel();

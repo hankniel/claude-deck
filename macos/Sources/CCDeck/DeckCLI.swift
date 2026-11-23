@@ -31,6 +31,7 @@ struct AccountInfo: Codable, Identifiable, Hashable {
         case "ok": return "Ready"
         case "loading": return "Checking usage…"
         case "logged_out": return "Not logged in"
+        case "no_data": return "Usage shows once a session runs on it"
         case "expired": return "Refreshes on next use"
         default: return "Couldn't read usage"
         }
@@ -234,7 +235,6 @@ enum DeckCLI {
     static func set(_ key: String, _ value: String) async throws { try await run(["config", key, value]) }
     static func map(_ account: String, dir: String) async throws { try await run(["map", account, dir]) }
     static func unmap(_ dir: String) async throws { try await run(["unmap", dir]) }
-    static func add(_ name: String) async throws { try await run(["add", name, "--no-login"]) }
     static func remove(_ name: String) async throws { try await run(["rm", name]) }
     static func setDisabled(_ name: String, _ disabled: Bool) async throws {
         try await run([disabled ? "disable" : "enable", name])

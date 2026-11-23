@@ -3,6 +3,7 @@
 use crate::canvas::Callback;
 use crate::widgets::label;
 use gtk::prelude::*;
+use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,9 @@ pub struct FileTree {
     show_hidden: Cell<bool>,
     pub on_open: Callback<dyn Fn(&Path)>,
     me: RefCell<Weak<FileTree>>,
+    /// Watches the shown folders so files created or removed (e.g. by Claude) show up.
+    monitors: RefCell<Vec<(PathBuf, gio::FileMonitor)>>,
+    pending: Cell<bool>,
 }
 
 fn entries(dir: &Path, hidden: bool) -> Vec<(PathBuf, bool)> {
@@ -51,7 +55,6 @@ fn entries(dir: &Path, hidden: bool) -> Vec<(PathBuf, bool)> {
                     let d = p.is_dir();
                     (p, d)
                 })
-                .take(MAX_ENTRIES)
                 .collect()
         })
         .unwrap_or_default();
@@ -62,6 +65,7 @@ fn entries(dir: &Path, hidden: bool) -> Vec<(PathBuf, bool)> {
             an.cmp(&bn)
         })
     });
+    v.truncate(MAX_ENTRIES);
     v
 }
 
@@ -79,6 +83,8 @@ impl FileTree {
             show_hidden: Cell::new(crate::prefs::get("wb.files_hidden").as_deref() == Some("1")),
             on_open: RefCell::new(None),
             me: RefCell::new(Weak::new()),
+            monitors: RefCell::new(vec![]),
+            pending: Cell::new(false),
         });
         *t.me.borrow_mut() = Rc::downgrade(&t);
         let me = Rc::downgrade(&t);
@@ -126,10 +132,24 @@ impl FileTree {
     }
 
     pub fn rebuild(&self) {
+        // Removing every row resets the scroll position; put it back afterwards.
+        let adj = self
+            .list
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_downcast::<gtk::ScrolledWindow>()
+            .map(|s| s.vadjustment());
+        let scroll = adj.as_ref().map(|a| a.value());
         for (r, _, _) in self.rows.borrow_mut().drain(..) {
             self.list.remove(&r);
         }
-        let Some(root) = self.root() else { return };
+        let Some(root) = self.root() else {
+            self.monitors.borrow_mut().clear();
+            return;
+        };
+        self.watch(&root);
+        if let (Some(adj), Some(v)) = (adj, scroll) {
+            glib::idle_add_local_once(move || adj.set_value(v.min(adj.upper() - adj.page_size()).max(0.0)));
+        }
         let mut rows = vec![];
         self.add_dir(&root, 0, &mut rows);
         if rows.is_empty() {
@@ -149,6 +169,44 @@ impl FileTree {
             }
         }
         *self.rows.borrow_mut() = rows;
+    }
+
+    /// Monitor the root and every expanded folder; a change rebuilds the tree once.
+    fn watch(&self, root: &Path) {
+        let mut want: Vec<PathBuf> = vec![root.to_path_buf()];
+        want.extend(self.expanded.borrow().iter().filter(|p| p.starts_with(root)).cloned());
+        let mut mons = self.monitors.borrow_mut();
+        mons.retain(|(p, m)| {
+            let keep = want.contains(p);
+            if !keep {
+                m.cancel();
+            }
+            keep
+        });
+        for dir in want {
+            if mons.iter().any(|(p, _)| *p == dir) {
+                continue;
+            }
+            let Ok(m) = gio::File::for_path(&dir).monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE) else { continue };
+            let me = self.me.borrow().clone();
+            m.connect_changed(move |_, _, _, ev| {
+                if matches!(ev, gio::FileMonitorEvent::Changed | gio::FileMonitorEvent::ChangesDoneHint | gio::FileMonitorEvent::AttributeChanged) {
+                    return;
+                }
+                let Some(t) = me.upgrade() else { return };
+                if t.pending.replace(true) {
+                    return;
+                }
+                let me = Rc::downgrade(&t);
+                glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                    if let Some(t) = me.upgrade() {
+                        t.pending.set(false);
+                        t.rebuild();
+                    }
+                });
+            });
+            mons.push((dir, m));
+        }
     }
 
     fn add_dir(&self, dir: &Path, depth: i32, rows: &mut Vec<(gtk::ListBoxRow, PathBuf, bool)>) {

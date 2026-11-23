@@ -108,6 +108,7 @@ const SHORTCUTS_UI: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child><object class="GtkShortcutsShortcut"><property name="title">Next / previous terminal</property><property name="accelerator">&lt;Ctrl&gt;Page_Down &lt;Ctrl&gt;Page_Up</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Go to terminal 1–9</property><property name="accelerator">&lt;Alt&gt;1...9</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Copy / paste</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;c &lt;Ctrl&gt;&lt;Shift&gt;v</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Find in terminal (Enter: older, Shift+Enter: newer)</property><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;f</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Zoom in / out / reset</property><property name="accelerator">&lt;Ctrl&gt;plus &lt;Ctrl&gt;minus &lt;Ctrl&gt;0</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="title">Newline in Claude's prompt</property><property name="accelerator">&lt;Shift&gt;Return</property></object></child>
           </object>

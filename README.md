@@ -151,20 +151,31 @@ cargo install --path .
 
 ## Accounts
 
-`default` is your normal `~/.claude` login. Every other account is a profile dir passed to
-Claude Code as `CLAUDE_CONFIG_DIR` (`~/.local/share/claude-deck/profiles/<name>`). Claude Code
-keeps each profile's own login (macOS Keychain or `.credentials.json`); claude-deck only reads
-the token to show usage and never refreshes or copies it.
+Every account runs on the one `~/.claude` config, so settings, CLAUDE.md, skills, agents,
+plugins, hooks, MCP servers, folder trust and conversation history are the same everywhere.
+Accounts differ only in who is signed in:
 
-Profiles symlink the shared parts of `~/.claude` (settings, CLAUDE.md, skills, agents, plugins,
-projects/history...), so every account sees the same setup and conversations. Edit `shared` in
-the config to change that. User-scope MCP servers live in each profile's own `.claude.json`.
+- `default` is the login Claude Code keeps in `~/.claude` itself (`/login`).
+- Every other account is a long-lived token from `claude setup-token`, stored in
+  `~/.local/share/claude-deck/tokens/<name>` (mode 600) and given to its sessions as
+  `CLAUDE_CODE_OAUTH_TOKEN`.
+
+These tokens can't read the usage endpoint, so CC Deck gives the sessions it starts a status
+line that records the 5-hour / 7-day limits Claude Code gets with every reply, then runs your
+own `statusLine` command unchanged. A token account's usage therefore shows once a session has
+run on it, and updates while one does. Token sessions may lack claude.ai features that need a
+full login (claude.ai MCP connectors, plugin sync); the email and plan of a token account are
+unknown, so its name is its label.
 
 ```bash
-claude-deck add personal      # creates the profile and opens claude: /login, then /exit
+claude-deck add personal      # runs claude setup-token, then asks for the token
+claude-deck add personal --token -   # or pipe one in (also renews an expired token)
 claude-deck list              # usage of every account
 claude-deck rm personal
 ```
+
+Older versions made a config dir per account under `~/.local/share/claude-deck/profiles/`.
+Those are no longer used (they are left on disk); add the accounts again with `claude-deck add`.
 
 ## Use
 
@@ -172,7 +183,7 @@ claude-deck rm personal
 claude-deck                   # TUI; first tab uses the mapped account or asks
 claude-deck -a work -- --resume   # first tab on work, extra args for claude
 claude-deck run personal      # plain claude on one account, no TUI
-eval "$(claude-deck env work)"  # export CLAUDE_CONFIG_DIR in this shell
+eval "$(claude-deck env work)"  # put claude in this shell on work
 ```
 
 Keys (prefix `Ctrl-a`): `c` new tab · `C` new tab, always pick · `s` move this tab to another

@@ -1,22 +1,24 @@
-//! Accounts are Claude Code config dirs. `default` is the plain ~/.claude login;
-//! every other account is a profile dir passed to Claude Code as CLAUDE_CONFIG_DIR.
-//! Claude Code itself owns each profile's login (keychain entry or .credentials.json),
-//! so tokens are never copied between accounts and only read for usage checks.
+//! Accounts are logins on the one ~/.claude config. `default` is the login Claude Code keeps
+//! there itself; every other account is a long-lived token from `claude setup-token`, given to
+//! its sessions as CLAUDE_CODE_OAUTH_TOKEN. Settings, skills, plugins, MCP and history are
+//! shared because every session runs on the same config.
 
-use crate::config::{default_claude_dir, home, profiles_dir, Config};
+use crate::config::{data_dir, default_claude_dir, home, profiles_dir};
 use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use unicode_normalization::UnicodeNormalization;
+use std::time::Duration;
 
 pub const DEFAULT: &str = "default";
+const TOKEN_PREFIX: &str = "sk-ant-oat";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Account {
     pub name: String,
     /// None for the default ~/.claude login.
-    pub config_dir: Option<PathBuf>,
+    pub token_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -26,59 +28,60 @@ pub struct OAuth {
     pub plan: Option<String>,
 }
 
+pub fn tokens_dir() -> PathBuf {
+    data_dir().join("tokens")
+}
+
 impl Account {
     pub fn default_account() -> Account {
-        Account { name: DEFAULT.into(), config_dir: None }
+        Account { name: DEFAULT.into(), token_file: None }
     }
 
+    pub fn is_default(&self) -> bool {
+        self.token_file.is_none()
+    }
+
+    /// The Claude Code config every account runs on.
     pub fn dir(&self) -> PathBuf {
-        self.config_dir.clone().unwrap_or_else(default_claude_dir)
-    }
-
-    /// Claude Code's global state file (holds `oauthAccount`).
-    fn global_json(&self) -> PathBuf {
-        match &self.config_dir {
-            Some(d) => d.join(".claude.json"),
-            None => home().join(".claude.json"),
-        }
+        default_claude_dir()
     }
 
     fn oauth_account(&self) -> Option<serde_json::Value> {
-        let s = std::fs::read_to_string(self.global_json()).ok()?;
+        if !self.is_default() {
+            return None;
+        }
+        let s = std::fs::read_to_string(home().join(".claude.json")).ok()?;
         let mut v: serde_json::Value = serde_json::from_str(&s).ok()?;
         Some(v.get_mut("oauthAccount")?.take())
     }
 
+    /// Known for `default` only: setup-token tokens can't read the profile.
     pub fn email(&self) -> Option<String> {
         self.oauth_account()?.get("emailAddress")?.as_str().map(String::from)
     }
 
-    /// Claude's account id; transcripts tag each message with it.
+    /// Claude's account id; transcripts of `default` sessions are tagged with it.
     pub fn account_uuid(&self) -> Option<String> {
         self.oauth_account()?.get("accountUuid")?.as_str().map(String::from)
     }
 
-    /// Mirrors Claude Code: `Claude Code-credentials` plus `-<sha256(dir)[..8]>`
-    /// when CLAUDE_CONFIG_DIR is set.
-    pub fn keychain_service(&self) -> String {
-        match &self.config_dir {
-            None => "Claude Code-credentials".into(),
-            Some(d) => {
-                let s: String = d.to_string_lossy().nfc().collect();
-                let h = Sha256::digest(s.as_bytes());
-                let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
-                format!("Claude Code-credentials-{}", &hex[..8])
-            }
-        }
+    pub fn token(&self) -> Option<String> {
+        let f = self.token_file.as_ref()?;
+        let t = std::fs::read_to_string(f).ok()?.trim().to_string();
+        (!t.is_empty()).then_some(t)
     }
 
+    /// The full login of `default` (keychain on macOS, else .credentials.json).
     pub fn oauth(&self) -> Result<Option<OAuth>> {
+        if !self.is_default() {
+            return Ok(None);
+        }
         let mut raw = None;
         if cfg!(target_os = "macos") {
-            raw = read_keychain(&self.keychain_service())?;
+            raw = read_keychain("Claude Code-credentials")?;
         }
         if raw.is_none() {
-            raw = std::fs::read_to_string(self.dir().join(".credentials.json")).ok();
+            raw = std::fs::read_to_string(default_claude_dir().join(".credentials.json")).ok();
         }
         let Some(raw) = raw else { return Ok(None) };
         let v: serde_json::Value = serde_json::from_str(&raw).context("parsing credentials")?;
@@ -91,14 +94,61 @@ impl Account {
         }))
     }
 
+    /// Environment for a claude process on this account, as (name, Some(value) | None to unset).
+    pub fn env(&self) -> Vec<(&'static str, Option<String>)> {
+        vec![
+            ("CLAUDE_CONFIG_DIR", None),
+            ("CLAUDE_CODE_OAUTH_TOKEN", self.token()),
+            ("CLAUDE_DECK_ACCOUNT", Some(self.name.clone())),
+        ]
+    }
+
     /// Point a std Command at this account.
     pub fn apply_env(&self, cmd: &mut Command) {
-        match &self.config_dir {
-            Some(d) => cmd.env("CLAUDE_CONFIG_DIR", d),
-            None => cmd.env_remove("CLAUDE_CONFIG_DIR"),
-        };
-        cmd.env("CLAUDE_DECK_ACCOUNT", &self.name);
+        for (k, v) in self.env() {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
     }
+
+    /// claude's args for a session: the user's, plus a status line that reports this
+    /// account's usage (Claude Code hands its rate limits to the status line).
+    pub fn claude_args(&self, cwd: &Path, user: &[String]) -> Vec<String> {
+        let mut out = user.to_vec();
+        if user.iter().any(|a| a == "--settings" || a.starts_with("--settings=")) {
+            return out;
+        }
+        let Ok(exe) = std::env::current_exe() else { return out };
+        let mut line = serde_json::json!({
+            "type": "command",
+            "command": format!("{} statusline", shell_quote(&exe.to_string_lossy())),
+        });
+        if let Some(p) = user_statusline(cwd).and_then(|s| s.get("padding").cloned()) {
+            line["padding"] = p;
+        }
+        out.push("--settings".into());
+        out.push(serde_json::json!({ "statusLine": line }).to_string());
+        out
+    }
+}
+
+/// The status line the user configured, nearest settings file first.
+pub fn user_statusline(cwd: &Path) -> Option<serde_json::Value> {
+    let files = [
+        cwd.join(".claude/settings.local.json"),
+        cwd.join(".claude/settings.json"),
+        default_claude_dir().join("settings.json"),
+    ];
+    files.iter().find_map(|f| {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(f).ok()?).ok()?;
+        v.get("statusLine").filter(|s| s.get("command").is_some()).cloned()
+    })
+}
+
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn read_keychain(service: &str) -> Result<Option<String>> {
@@ -144,20 +194,20 @@ pub fn valid_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `default` first, then profiles sorted by name.
+/// `default` first, then token accounts sorted by name.
 pub fn list() -> Vec<Account> {
     let mut out = vec![Account::default_account()];
-    let mut names: Vec<String> = std::fs::read_dir(profiles_dir())
+    let mut names: Vec<String> = std::fs::read_dir(tokens_dir())
         .map(|rd| {
             rd.filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
+                .filter(|e| e.path().is_file())
                 .filter_map(|e| e.file_name().into_string().ok())
                 .filter(|n| valid_name(n).is_ok() && n != DEFAULT)
                 .collect()
         })
         .unwrap_or_default();
     names.sort();
-    out.extend(names.into_iter().map(|n| Account { config_dir: Some(profiles_dir().join(&n)), name: n }));
+    out.extend(names.into_iter().map(|n| Account { token_file: Some(tokens_dir().join(&n)), name: n }));
     out
 }
 
@@ -168,19 +218,59 @@ pub fn find(name: &str) -> Result<Account> {
         .with_context(|| format!("no account named {name:?} (see `claude-deck list`)"))
 }
 
-pub fn create(name: &str, cfg: &Config) -> Result<Account> {
+/// Whitespace is dropped so a token copied across wrapped terminal lines still works.
+pub fn clean_token(raw: &str) -> Result<String> {
+    let t: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    if !t.starts_with(TOKEN_PREFIX) {
+        bail!("that doesn't look like a `claude setup-token` token (it starts with {TOKEN_PREFIX}…)");
+    }
+    Ok(t)
+}
+
+pub enum TokenCheck {
+    Valid,
+    Rejected,
+    Unknown(String),
+}
+
+/// Ask the API whether the token is accepted, without using any quota.
+pub fn check_token(token: &str) -> TokenCheck {
+    let r = ureq::post("https://api.anthropic.com/v1/messages/count_tokens")
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("anthropic-version", "2023-06-01")
+        .set("anthropic-beta", "oauth-2025-04-20")
+        .set("User-Agent", concat!("claude-deck/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(15))
+        .send_json(serde_json::json!({
+            "model": "claude-haiku-5-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+    match r {
+        Ok(_) => TokenCheck::Valid,
+        Err(ureq::Error::Status(401 | 403, _)) => TokenCheck::Rejected,
+        Err(e) => TokenCheck::Unknown(e.to_string()),
+    }
+}
+
+/// Store (or replace) the token of account `name`.
+pub fn save(name: &str, token: &str) -> Result<Account> {
     valid_name(name)?;
     if name == DEFAULT {
-        bail!("`default` is the plain ~/.claude login and always exists");
+        bail!("`default` is your ~/.claude login; log in there with `claude` and /login");
     }
-    let dir = profiles_dir().join(name);
-    if dir.exists() {
-        bail!("account {name:?} already exists");
-    }
+    let token = clean_token(token)?;
+    let dir = tokens_dir();
     std::fs::create_dir_all(&dir)?;
-    let acc = Account { name: name.into(), config_dir: Some(dir) };
-    link_shared(&acc, cfg)?;
-    Ok(acc)
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let path = dir.join(name);
+    let tmp = dir.join(format!(".{name}.tmp"));
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(token.as_bytes())?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(Account { name: name.into(), token_file: Some(path) })
 }
 
 pub fn remove(name: &str) -> Result<()> {
@@ -188,43 +278,32 @@ pub fn remove(name: &str) -> Result<()> {
         bail!("cannot remove the default account");
     }
     let acc = find(name)?;
-    let dir = acc.config_dir.clone().unwrap();
-    if cfg!(target_os = "macos") {
-        let _ = Command::new("security")
-            .args(["delete-generic-password", "-s", &acc.keychain_service()])
-            .output();
-    }
-    // Remove symlinks first so remove_dir_all never walks into shared data.
-    for e in std::fs::read_dir(&dir)?.flatten() {
-        if e.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
-            std::fs::remove_file(e.path())?;
-        }
-    }
-    std::fs::remove_dir_all(&dir)?;
+    std::fs::remove_file(acc.token_file.unwrap())?;
+    let _ = std::fs::remove_file(crate::usage::live_path(name));
     Ok(())
 }
 
-/// Symlink each shared ~/.claude item into the profile, leaving existing entries alone.
-/// Returns the items that could not be linked because the profile has its own copy.
-pub fn link_shared(acc: &Account, cfg: &Config) -> Result<Vec<String>> {
-    let Some(dir) = &acc.config_dir else { return Ok(vec![]) };
-    let src_root = default_claude_dir();
-    let mut conflicts = vec![];
-    for item in &cfg.shared {
-        let src = src_root.join(item);
-        let dst = dir.join(item);
-        if item == "projects" && !src.exists() {
-            std::fs::create_dir_all(&src)?;
-        }
-        if !src.exists() {
-            continue;
-        }
-        match std::fs::symlink_metadata(&dst) {
-            Ok(m) if m.file_type().is_symlink() => {}
-            Ok(_) => conflicts.push(item.clone()),
-            Err(_) => std::os::unix::fs::symlink(&src, &dst)
-                .with_context(|| format!("linking {}", dst.display()))?,
-        }
+/// accountUuid -> name from the profile dirs older versions created, so their sessions
+/// stay attributed to the account of the same name.
+pub fn legacy_uuids() -> HashMap<String, String> {
+    let Ok(rd) = std::fs::read_dir(profiles_dir()) else { return HashMap::new() };
+    rd.flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let s = std::fs::read_to_string(e.path().join(".claude.json")).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+            Some((v.get("oauthAccount")?.get("accountUuid")?.as_str()?.to_string(), name))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_cleanup() {
+        assert_eq!(clean_token(" sk-ant-oat01-ab\n  cd \n").unwrap(), "sk-ant-oat01-abcd");
+        assert!(clean_token("sk-ant-api03-x").is_err());
     }
-    Ok(conflicts)
 }
