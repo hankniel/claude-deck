@@ -1140,7 +1140,7 @@ impl Deck {
             let claude = t.claude.borrow().is_some();
             let key = term_key(&t.id);
             let title = match t.claude.borrow().as_ref() {
-                Some(r) => format!("{} · {}", t.display_title(), r.account),
+                Some(r) => format!("{} · {}", t.display_title(), r.label()),
                 None => t.display_title(),
             };
             self.wb.set_title(&key, &title, Some(&format!("{}\n{}", t.display_title(), t.subtitle())));
@@ -1295,7 +1295,7 @@ impl Deck {
             let mut sub = tab.subtitle();
             if running {
                 if let Some(r) = tab.claude.borrow().as_ref() {
-                    sub = r.account.clone();
+                    sub = r.label();
                 }
                 if !state.is_empty() {
                     sub = format!("{sub} · {state}");
@@ -1378,7 +1378,7 @@ impl Deck {
             (Some(k), Some(t)) if k.starts_with("term:") => {
                 let place = crate::model::short_path(&t.current_dir());
                 match t.claude.borrow().as_ref() {
-                    Some(r) => format!("{place}  —  Claude · {}", r.account),
+                    Some(r) => format!("{place}  —  Claude · {}", r.label()),
                     None => place,
                 }
             }
@@ -1419,9 +1419,9 @@ impl Deck {
                 let cfg = self.config.borrow();
                 let acc = accs.iter().find(|a| a.name == run.account);
                 let txt = match (acc.and_then(|a| a.five_pct()), acc.and_then(|a| a.week_pct())) {
-                    (Some(f), Some(w)) => format!("{} · 5h {:.0}% · 7d {:.0}%", run.account, f, w),
-                    (Some(f), None) => format!("{} · 5h {:.0}%", run.account, f),
-                    _ => run.account.clone(),
+                    (Some(f), Some(w)) => format!("{} · 5h {:.0}% · 7d {:.0}%", run.label(), f, w),
+                    (Some(f), None) => format!("{} · 5h {:.0}%", run.label(), f),
+                    _ => run.label(),
                 };
                 self.account_label.set_text(&txt);
                 if acc.is_some_and(|a| a.over(&cfg)) {
@@ -1622,8 +1622,14 @@ impl Deck {
     /// Open a tab that signs `name` in: /login for `default`, a new token for the others.
     pub fn login(self: &Rc<Self>, name: &str) {
         let bin = if self.cli.is_some() { "\"$CC_DECK_BIN\"" } else { "claude-deck" };
+        let config_dir = accounts::find(name).ok().and_then(|a| a.config_dir);
         let (cmd, hint) = if name == accounts::DEFAULT {
             ("env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN claude".to_string(), format!("Log in to {name} with /login, then keep working or /exit"))
+        } else if let Some(d) = config_dir {
+            (
+                format!("env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={} claude", accounts::shell_quote(&d.to_string_lossy())),
+                format!("Log in to {name} with /login, then keep working or /exit"),
+            )
         } else {
             (format!("{bin} add {name}"), format!("Sign in to {name} in the browser, then paste the token"))
         };
@@ -1713,6 +1719,7 @@ impl Deck {
                 let Some(account) = v.get("account").and_then(|a| a.as_str()) else { return };
                 *tab.claude.borrow_mut() = Some(ClaudeRun {
                     account: account.to_string(),
+                    profile: v.get("profile").and_then(|p| p.as_str()).unwrap_or(accounts::DEFAULT).to_string(),
                     session_id: v.get("session_id").and_then(|s| s.as_str()).map(String::from),
                     cwd: v.get("cwd").and_then(|c| c.as_str()).map(String::from).unwrap_or_else(|| tab.cwd.borrow().clone()),
                     started: std::time::SystemTime::now(),
@@ -1743,12 +1750,25 @@ impl Deck {
         *self.picker.borrow_mut() = Some(p);
     }
 
-    pub fn answer_pick(self: &Rc<Self>, req: &PickReq, account: Option<&str>, remember: bool) {
+    /// `profile` is where a token account runs (None for a logged-in account: its own).
+    pub fn answer_pick(self: &Rc<Self>, req: &PickReq, account: Option<&str>, profile: Option<&str>, remember: bool) {
         match account {
             Some(a) => {
-                req.conn.send(json!({"account": a}));
-                if remember && self.config.borrow().account_for(Path::new(&req.cwd)).as_deref() != Some(a) {
-                    self.map_dir(a, Path::new(&req.cwd));
+                req.conn.send(json!({"account": a, "profile": profile}));
+                if remember {
+                    let cwd = Path::new(&req.cwd);
+                    if self.config.borrow().account_for(cwd).as_deref() != Some(a) {
+                        self.map_dir(a, cwd);
+                    }
+                    if let Some(p) = profile {
+                        if self.config.borrow().profile_for(cwd).as_deref() != Some(p) {
+                            let d = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()).to_string_lossy().to_string();
+                            let p = p.to_string();
+                            self.update_config(|c| {
+                                c.profile_maps.insert(d, p);
+                            });
+                        }
+                    }
                 }
             }
             None => req.conn.send(json!({"cancel": true})),
@@ -2087,8 +2107,9 @@ impl Deck {
         for t in self.tabs.borrow().iter() {
             match t.claude.borrow().as_ref() {
                 Some(r) => {
+                    let dir = accounts::find_profile(&r.profile).map(|p| p.dir()).unwrap_or_else(|_| claude_deck::config::default_claude_dir());
                     let sid = claude_deck::pty::current_session(
-                        &claude_deck::config::default_claude_dir(),
+                        &dir,
                         Path::new(&r.cwd),
                         r.started,
                         r.session_id.clone(),
@@ -2097,7 +2118,7 @@ impl Deck {
                     if let Some(s) = &sid {
                         claimed.push(s.clone());
                     }
-                    out.push(json!({"cwd": r.cwd, "account": r.account, "session": sid}));
+                    out.push(json!({"cwd": r.cwd, "account": r.account, "profile": r.profile, "session": sid}));
                 }
                 None => out.push(json!({"cwd": t.cwd.borrow().clone()})),
             }
@@ -2116,10 +2137,16 @@ impl Deck {
         let mut opened = false;
         for e in tabs {
             let Some(cwd) = e.get("cwd").and_then(|c| c.as_str()).filter(|c| Path::new(c).is_dir()) else { continue };
+            let profile = e
+                .get("profile")
+                .and_then(|p| p.as_str())
+                .filter(|p| accounts::valid_name(p).is_ok())
+                .map(|p| format!(" --profile {p}"))
+                .unwrap_or_default();
             let run = e.get("account").and_then(|a| a.as_str()).filter(|a| accounts::valid_name(a).is_ok()).map(|acc| {
                 match e.get("session").and_then(|s| s.as_str()).filter(|s| s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')) {
-                    Some(sid) => format!("{bin} launch --account {acc} -- --resume {sid}"),
-                    None => format!("{bin} launch --account {acc} -- --continue"),
+                    Some(sid) => format!("{bin} launch --account {acc}{profile} -- --resume {sid}"),
+                    None => format!("{bin} launch --account {acc}{profile} -- --continue"),
                 }
             });
             self.new_tab(Some(cwd.to_string()), run);

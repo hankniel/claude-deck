@@ -10,7 +10,7 @@ use claude_deck::config::Config;
 use claude_deck::{accounts, usage};
 use std::io::{BufRead, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use claude_deck::usage::Usage;
 
@@ -34,8 +34,12 @@ enum Cmd {
     Add {
         name: String,
         /// Use this token instead of running `claude setup-token` (`-` reads it from stdin).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "config_dir")]
         token: Option<String>,
+        /// Run this account on its own Claude Code config dir (CLAUDE_CONFIG_DIR, e.g.
+        /// ~/.claude-bravestars) with the login, settings, plugins and history kept there.
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
     },
     /// Remove an account and its stored token.
     Rm { name: String },
@@ -46,17 +50,32 @@ enum Cmd {
     Run {
         /// Account name or email; picks the mapped account or asks when omitted.
         name: Option<String>,
+        /// Profile (Claude Code config) a token account runs on; default: the folder's, else `default`.
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Map a directory (default: current) to an account.
-    Map { account: String, dir: Option<PathBuf> },
+    /// List profiles: the Claude Code configs sessions run on (`default` and config-dir accounts).
+    Profiles,
+    /// Map a directory (default: current) to an account, and optionally a profile.
+    Map {
+        account: String,
+        dir: Option<PathBuf>,
+        /// Profile token accounts run on in this directory.
+        #[arg(long)]
+        profile: Option<String>,
+    },
     /// Remove a directory mapping (default: current directory).
     Unmap { dir: Option<PathBuf> },
     /// List directory mappings.
     Maps,
     /// Print the shell exports that put claude on an account (eval it in a shell).
-    Env { name: String },
+    Env {
+        name: String,
+        #[arg(long)]
+        profile: Option<String>,
+    },
     /// Exclude an account from automatic choices.
     Disable { name: String },
     /// Put a disabled account back into automatic choices.
@@ -70,6 +89,8 @@ enum Cmd {
     Launch {
         #[arg(long)]
         account: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -101,7 +122,8 @@ fn main() -> Result<()> {
     let mut cfg = Config::load()?;
     match cli.cmd {
         None => tui::run(cfg, tui::Options { account: cli.account, claude_args: cli.claude_args }),
-        Some(Cmd::Add { name, token }) => add(&cfg, &name, token),
+        Some(Cmd::Add { name, config_dir: Some(dir), .. }) => add_dir(&name, &dir),
+        Some(Cmd::Add { name, token, .. }) => add(&cfg, &name, token),
         Some(Cmd::Rm { name }) => {
             accounts::remove(&name)?;
             cfg.maps.retain(|_, a| a != &name);
@@ -111,8 +133,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Cmd::List) => list(&cfg),
-        Some(Cmd::Launch { account, args }) => {
-            let code = launch::run(&cfg, account, args)?;
+        Some(Cmd::Launch { account, profile, args }) => {
+            let code = launch::run(&cfg, account, profile, args)?;
             std::process::exit(code);
         }
         Some(Cmd::State { record }) => state_json(&cfg, record),
@@ -125,29 +147,47 @@ fn main() -> Result<()> {
             claude_deck::stats::log_event(&kind, account.as_deref(), &message, serde_json::json!({}));
             Ok(())
         }
-        Some(Cmd::Run { name, args }) => {
+        Some(Cmd::Run { name, profile, args }) => {
             let cwd = std::env::current_dir()?;
             let name = match name.or_else(|| cfg.account_for(&cwd)) {
                 Some(n) => n,
                 None => prompt_account()?,
             };
-            let acc = accounts::find(&name)?;
+            let acc = accounts::for_session(&name, profile.as_deref(), &cfg, &cwd)?;
             let mut c = Command::new(&cfg.claude_bin);
             c.args(acc.claude_args(&cwd, &args));
             acc.apply_env(&mut c);
             Err(c.exec()).context("starting claude")
         }
-        Some(Cmd::Map { account, dir }) => {
-            let acc = accounts::find(&account)?;
+        Some(Cmd::Map { account, dir, profile }) => {
+            let acc = accounts::find_on(&account, profile.as_deref())?;
             let dir = abs_dir(dir)?;
-            cfg.maps.insert(dir.to_string_lossy().into(), acc.name.clone());
+            let key: String = dir.to_string_lossy().into();
+            cfg.maps.insert(key.clone(), acc.name.clone());
+            match &profile {
+                Some(p) => {
+                    cfg.profile_maps.insert(key, p.clone());
+                }
+                None => {
+                    cfg.profile_maps.remove(&key);
+                }
+            }
             cfg.save()?;
-            println!("{} → {}", dir.display(), acc.name);
+            let on = profile.map(|p| format!(" on profile {p}")).unwrap_or_default();
+            println!("{} → {}{on}", dir.display(), acc.name);
+            Ok(())
+        }
+        Some(Cmd::Profiles) => {
+            for p in accounts::profiles() {
+                println!("{:<14} {}", p.name, p.dir().display());
+            }
             Ok(())
         }
         Some(Cmd::Unmap { dir }) => {
             let dir = abs_dir(dir)?;
-            if cfg.maps.remove(dir.to_string_lossy().as_ref()).is_none() {
+            let key = dir.to_string_lossy().to_string();
+            let had_profile = cfg.profile_maps.remove(&key).is_some();
+            if cfg.maps.remove(&key).is_none() && !had_profile {
                 bail!("{} is not mapped", dir.display());
             }
             cfg.save()?;
@@ -159,12 +199,18 @@ fn main() -> Result<()> {
                 println!("no mappings (claude-deck map <account> [dir])");
             }
             for (d, a) in &cfg.maps {
-                println!("{d} → {a}");
+                match cfg.profile_maps.get(d) {
+                    Some(p) => println!("{d} → {a} on profile {p}"),
+                    None => println!("{d} → {a}"),
+                }
+            }
+            for (d, p) in cfg.profile_maps.iter().filter(|(d, _)| !cfg.maps.contains_key(*d)) {
+                println!("{d} → profile {p}");
             }
             Ok(())
         }
-        Some(Cmd::Env { name }) => {
-            let acc = accounts::find(&name)?;
+        Some(Cmd::Env { name, profile }) => {
+            let acc = accounts::find_on(&name, profile.as_deref())?;
             for (k, v) in acc.env() {
                 match v {
                     Some(v) => println!("export {k}={}", accounts::shell_quote(&v)),
@@ -297,6 +343,7 @@ fn state_json(cfg: &Config, record: bool) -> Result<()> {
             "name": acc.name,
             "email": acc.email(),
             "account_uuid": acc.account_uuid(),
+            "has_login": acc.has_login(),
             "plan": plan,
             "disabled": cfg.disabled.contains(&acc.name),
             "state": state,
@@ -310,6 +357,7 @@ fn state_json(cfg: &Config, record: bool) -> Result<()> {
     }
     let v = json!({
         "accounts": out,
+        "profiles": accounts::profiles().iter().map(|p| json!({"name": p.name, "dir": p.dir()})).collect::<Vec<_>>(),
         "config": {
             "threshold": cfg.threshold,
             "weekly_threshold": cfg.weekly_threshold,
@@ -318,6 +366,7 @@ fn state_json(cfg: &Config, record: bool) -> Result<()> {
             "cooldown_secs": cfg.cooldown_secs,
             "poll_secs": cfg.poll_secs,
             "maps": cfg.maps,
+            "profile_maps": cfg.profile_maps,
         }
     });
     println!("{v}");
@@ -396,6 +445,15 @@ fn add(cfg: &Config, name: &str, token: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn add_dir(name: &str, dir: &Path) -> Result<()> {
+    let renewed = accounts::find(name).is_ok();
+    let acc = accounts::save_dir(name, dir)?;
+    claude_deck::stats::log_event("account", Some(name), if renewed { "account changed" } else { "account added" }, serde_json::json!({}));
+    let who = acc.email().map(|e| format!(" ({e})")).unwrap_or_else(|| ", not logged in yet: start claude on it and /login".into());
+    println!("{name} runs on {}{who}.", acc.dir().display());
+    Ok(())
+}
+
 fn read_hidden(prompt: &str) -> Result<String> {
     eprint!("{prompt}");
     std::io::stderr().flush()?;
@@ -431,7 +489,8 @@ fn statusline() -> Result<()> {
         .and_then(|c| c.as_str())
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let Some(cmd) = accounts::user_statusline(&cwd).and_then(|s| s.get("command")?.as_str().map(String::from)) else {
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(claude_deck::config::default_claude_dir);
+    let Some(cmd) = accounts::user_statusline(&cwd, &config_dir).and_then(|s| s.get("command")?.as_str().map(String::from)) else {
         return Ok(());
     };
     let mut child = Command::new("sh")

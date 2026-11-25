@@ -54,6 +54,8 @@ pub struct Config {
     pub disabled: Vec<String>,
     /// Directory -> account. Subdirectories inherit the nearest mapped ancestor.
     pub maps: BTreeMap<String, String>,
+    /// Directory -> profile the token accounts run on there. Subdirectories inherit.
+    pub profile_maps: BTreeMap<String, String>,
     /// Recently used session directories, newest first (desktop app).
     pub recent: Vec<String>,
 }
@@ -70,6 +72,7 @@ impl Default for Config {
             claude_bin: "claude".into(),
             disabled: vec![],
             maps: BTreeMap::new(),
+            profile_maps: BTreeMap::new(),
             recent: vec![],
         }
     }
@@ -102,6 +105,13 @@ impl Config {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         dir.ancestors()
             .find_map(|a| self.maps.get(a.to_string_lossy().as_ref()).cloned())
+    }
+
+    /// The profile mapped to `dir` or its nearest mapped ancestor.
+    pub fn profile_for(&self, dir: &Path) -> Option<String> {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        dir.ancestors()
+            .find_map(|a| self.profile_maps.get(a.to_string_lossy().as_ref()).cloned())
     }
 
     pub fn push_recent(&mut self, dir: &Path) {

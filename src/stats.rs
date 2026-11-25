@@ -160,7 +160,8 @@ fn parse_line(line: &str) -> Option<(String, Rec)> {
 }
 
 fn transcript_files(cutoff: SystemTime) -> Vec<PathBuf> {
-    let roots = vec![default_claude_dir().join("projects")];
+    let mut roots = vec![default_claude_dir().join("projects")];
+    roots.extend(accounts::list().into_iter().filter_map(|a| a.config_dir).map(|d| d.join("projects")));
     let mut seen = HashSet::new();
     let mut out = vec![];
     fn walk(dir: &Path, depth: usize, cutoff: SystemTime, out: &mut Vec<PathBuf>) {

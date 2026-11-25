@@ -233,7 +233,12 @@ impl App {
             None => Start::New,
         };
         let size = (self.pane.height, self.pane.width);
-        match Tab::spawn(acc, &self.cfg, &cwd, size, start, self.dirty.clone()) {
+        // A token account runs on the folder's profile.
+        let acc = match self.cfg.profile_for(&cwd).and_then(|p| accounts::find_profile(&p).ok()) {
+            Some(p) => acc.on(&p),
+            None => acc.clone(),
+        };
+        match Tab::spawn(&acc, &self.cfg, &cwd, size, start, self.dirty.clone()) {
             Ok(t) => {
                 self.tabs.push(t);
                 self.active = self.tabs.len() - 1;
@@ -271,7 +276,13 @@ impl App {
             (t.cwd.clone(), t.current_session(&claimed))
         };
         let from = self.tabs[i].account.clone();
+        let from_dir = self.tabs[i].account_dir.clone();
+        // A token account keeps the tab's profile; a logged-in one brings its own.
+        let acc = &acc.on(&accounts::profile_by_dir(&from_dir).unwrap_or_else(Account::default_account));
         self.tabs[i].kill();
+        if let Some(s) = &session {
+            pty::carry_session(&from_dir, &acc.dir(), &cwd, s);
+        }
         let start = match session {
             Some(id) => Start::Resume(id),
             None => Start::Continue,

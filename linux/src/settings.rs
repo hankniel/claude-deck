@@ -239,7 +239,7 @@ impl Settings {
         let accounts_page = adw::PreferencesPage::builder().title("Accounts").icon_name("system-users-symbolic").name("accounts").build();
         let accounts_group = adw::PreferencesGroup::builder()
             .title("Accounts")
-            .description("“default” is your usual ~/.claude login. Other accounts are sign-in tokens: their sessions run on the same ~/.claude, so settings, skills, plugins, MCP and history are shared.")
+            .description("“default” is your usual ~/.claude login. Other accounts are sign-in tokens: their sessions run on the same ~/.claude, so settings, skills, plugins, MCP and history are shared. An account can instead run on a config dir of its own: claude-deck add <name> --config-dir <dir>.")
             .build();
         accounts_page.add(&accounts_group);
         let add_group = adw::PreferencesGroup::builder().title("Add an account").build();
@@ -459,7 +459,7 @@ impl Settings {
     fn confirm_remove(self: &Rc<Self>, name: &str) {
         let alert = adw::AlertDialog::new(
             Some(&format!("Remove {name}?")),
-            Some("Deletes its stored token. Your ~/.claude settings, skills and history are not touched."),
+            Some("Forgets its stored token or its config dir link. Claude Code configs, settings, skills and history are not touched."),
         );
         alert.add_response("cancel", "Cancel");
         alert.add_response("remove", "Remove");

@@ -10,6 +10,8 @@ use claude_deck::usage::{self, Usage, Window};
 pub struct AccountInfo {
     pub name: String,
     pub email: Option<String>,
+    /// `default` and config-dir accounts: logged in on their own profile.
+    pub has_login: bool,
     pub disabled: bool,
     pub usage: Usage,
 }
@@ -19,6 +21,7 @@ impl AccountInfo {
         AccountInfo {
             name: acc.name.clone(),
             email: acc.email(),
+            has_login: acc.has_login(),
             disabled: cfg.disabled.contains(&acc.name),
             usage,
         }

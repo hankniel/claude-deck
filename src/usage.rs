@@ -64,7 +64,7 @@ impl Usage {
 }
 
 pub fn fetch(acc: &Account) -> Usage {
-    if !acc.is_default() {
+    if !acc.has_login() {
         if acc.token().is_none() {
             return Usage::NotLoggedIn;
         }

@@ -7,9 +7,12 @@
 //!
 //! Socket protocol (JSON lines):
 //!   → {"type":"hello","tab":..,"cwd":..,"args":[..],"pick":bool}
-//!   ← {"account":"name"} | {"cancel":true}            (only when pick)
-//!   → {"type":"started","account":..,"session_id":..,"cwd":..}
+//!   ← {"account":"name","profile":"name"?} | {"cancel":true}   (only when pick)
+//!   → {"type":"started","account":..,"profile":..,"session_id":..,"cwd":..}
 //!   ← {"type":"switch","account":..,"claimed":[session ids of other tabs]}
+//!
+//! A token account keeps the session's profile when switched to; a logged-in account brings
+//! its own (the conversation is copied across).
 //!   → {"type":"exited","code":..}
 
 use anyhow::{bail, Context, Result};
@@ -59,7 +62,7 @@ impl Link {
     }
 }
 
-pub fn run(cfg: &Config, account: Option<String>, args: Vec<String>) -> Result<i32> {
+pub fn run(cfg: &Config, account: Option<String>, profile: Option<String>, args: Vec<String>) -> Result<i32> {
     // Ctrl-C belongs to claude. A no-op handler (not SIG_IGN) resets to default in the child.
     unsafe {
         libc::signal(libc::SIGINT, ignore_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
@@ -69,26 +72,27 @@ pub fn run(cfg: &Config, account: Option<String>, args: Vec<String>) -> Result<i
     let mut link = Link::connect().map(|(l, _)| l);
     let tab = std::env::var("CC_DECK_TAB").unwrap_or_default();
 
-    let name = match (&account, link.as_mut()) {
+    let (name, profile) = match (&account, link.as_mut()) {
         (Some(a), Some(l)) => {
             l.send(json!({"type":"hello","tab":tab,"cwd":cwd,"args":args,"pick":false}));
-            a.clone()
+            (a.clone(), profile)
         }
-        (Some(a), None) => a.clone(),
+        (Some(a), None) => (a.clone(), profile),
         (None, Some(l)) => {
             l.send(json!({"type":"hello","tab":tab,"cwd":cwd,"args":args,"pick":true}));
             match l.rx.recv() {
-                Ok(v) if v.get("account").and_then(|a| a.as_str()).is_some() => {
-                    v["account"].as_str().unwrap().to_string()
-                }
+                Ok(v) if v.get("account").and_then(|a| a.as_str()).is_some() => (
+                    v["account"].as_str().unwrap().to_string(),
+                    v.get("profile").and_then(|p| p.as_str()).map(String::from).or(profile),
+                ),
                 Ok(_) => return Ok(130),
-                Err(_) => prompt_terminal(cfg, &cwd)?,
+                Err(_) => prompt_terminal(cfg, &cwd, profile)?,
             }
         }
-        (None, None) => prompt_terminal(cfg, &cwd)?,
+        (None, None) => prompt_terminal(cfg, &cwd, profile)?,
     };
 
-    let mut acc = accounts::find(&name)?;
+    let mut acc = accounts::for_session(&name, profile.as_deref(), cfg, &cwd)?;
     let user_args = args.clone();
     let mut start_args = start_args_for_new(&user_args);
     loop {
@@ -96,7 +100,7 @@ pub fn run(cfg: &Config, account: Option<String>, args: Vec<String>) -> Result<i
         let started = SystemTime::now();
         let mut child = spawn(cfg, &acc, &cwd, &args)?;
         if let Some(l) = link.as_mut() {
-            l.send(json!({"type":"started","account":acc.name,"session_id":session_id,"cwd":cwd}));
+            l.send(json!({"type":"started","account":acc.name,"profile":acc.profile(),"session_id":session_id,"cwd":cwd}));
         }
         stats::log_event("start", Some(&acc.name), &format!("claude in {}", short(&cwd)),
             json!({"session_id": session_id, "cwd": cwd}));
@@ -110,8 +114,9 @@ pub fn run(cfg: &Config, account: Option<String>, args: Vec<String>) -> Result<i
                 return Ok(code);
             }
             Outcome::Switch { to, claimed } => {
+                let here = accounts::profile_by_dir(&acc.dir()).unwrap_or_else(Account::default_account);
                 let target = match accounts::find(&to) {
-                    Ok(t) => t,
+                    Ok(t) => t.on(&here),
                     Err(e) => {
                         eprintln!("claude-deck: {e:#}");
                         start_args = (session_id.clone(), resume_args(session_id.as_deref(), &user_args));
@@ -120,8 +125,12 @@ pub fn run(cfg: &Config, account: Option<String>, args: Vec<String>) -> Result<i
                 };
                 let resume = pty::current_session(&acc.dir(), &cwd, started, session_id.clone(), &claimed);
                 terminate(&mut child);
+                if let Some(s) = &resume {
+                    pty::carry_session(&acc.dir(), &target.dir(), &cwd, s);
+                }
                 reset_terminal();
-                eprintln!("\x1b[2m↻ moving this conversation from {} to {}…\x1b[0m", acc.name, target.name);
+                let place = if target.profile() == acc.profile() { String::new() } else { format!(" (profile {})", target.profile()) };
+                eprintln!("\x1b[2m↻ moving this conversation from {} to {}{place}…\x1b[0m", acc.name, target.name);
                 stats::log_event("switch", Some(&target.name), &format!("{} → {}", acc.name, target.name),
                     json!({"from": acc.name, "session_id": resume, "cwd": cwd}));
                 start_args = (resume.clone(), resume_args(resume.as_deref(), &user_args));
@@ -241,7 +250,39 @@ fn short(p: &Path) -> String {
     }
 }
 
-fn prompt_terminal(cfg: &Config, cwd: &Path) -> Result<String> {
+/// Ask for the account, then (for a token account, when there are several) the profile.
+fn prompt_terminal(cfg: &Config, cwd: &Path, profile: Option<String>) -> Result<(String, Option<String>)> {
+    let name = prompt_account(cfg, cwd)?;
+    let profiles = accounts::profiles();
+    if profile.is_some() || profiles.len() < 2 || accounts::find(&name)?.has_login() {
+        return Ok((name, profile));
+    }
+    let mapped = cfg.profile_for(cwd);
+    let default = mapped
+        .as_ref()
+        .and_then(|m| profiles.iter().position(|p| &p.name == m))
+        .unwrap_or(0);
+    eprintln!("Run {name} on which profile?");
+    for (i, p) in profiles.iter().enumerate() {
+        let mark = if i == default { "›" } else { " " };
+        eprintln!(" {mark} {}) {:<14} {}", i + 1, p.name, short(&p.dir()));
+    }
+    eprint!("profile [{}]: ", default + 1);
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line)? == 0 {
+        bail!("cancelled");
+    }
+    let line = line.trim();
+    let pick = match line.parse::<usize>() {
+        _ if line.is_empty() => profiles[default].name.clone(),
+        Ok(n) if (1..=profiles.len()).contains(&n) => profiles[n - 1].name.clone(),
+        _ => line.to_string(),
+    };
+    Ok((name, Some(pick)))
+}
+
+fn prompt_account(cfg: &Config, cwd: &Path) -> Result<String> {
     let accs = accounts::list();
     if accs.len() == 1 {
         return Ok(accs[0].name.clone());

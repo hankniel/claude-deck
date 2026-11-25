@@ -92,6 +92,32 @@ pub fn project_slug(cwd: &Path) -> String {
         .collect()
 }
 
+/// Copy conversation `session` of `cwd` from one Claude Code config dir to another, so
+/// `--resume` finds it after moving to an account on a different config dir.
+pub fn carry_session(from: &Path, to: &Path, cwd: &Path, session: &str) {
+    fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+        if src.is_dir() {
+            std::fs::create_dir_all(dst)?;
+            for e in std::fs::read_dir(src)?.flatten() {
+                copy_tree(&e.path(), &dst.join(e.file_name()))?;
+            }
+        } else if !dst.exists() {
+            std::fs::copy(src, dst)?;
+        }
+        Ok(())
+    }
+    if from == to {
+        return;
+    }
+    let slug = project_slug(cwd);
+    let (src, dst) = (from.join("projects").join(&slug), to.join("projects").join(&slug));
+    let _ = std::fs::create_dir_all(&dst);
+    let _ = copy_tree(&src.join(format!("{session}.jsonl")), &dst.join(format!("{session}.jsonl")));
+    if src.join(session).is_dir() {
+        let _ = copy_tree(&src.join(session), &dst.join(session));
+    }
+}
+
 /// The conversation a session is most likely on: the newest transcript for `cwd`
 /// written since it started (covers /clear), not claimed by another session.
 pub fn current_session(
@@ -144,5 +170,26 @@ mod tests {
             super::project_slug(std::path::Path::new("/nonexistent/a.b/c_d")),
             "-nonexistent-a-b-c-d"
         );
+    }
+}
+
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+
+    #[test]
+    fn carries_transcript_to_other_config_dir() {
+        let root = std::env::temp_dir().join(format!("cc-deck-carry-{}", std::process::id()));
+        let (from, to, cwd) = (root.join("a"), root.join("b"), root.join("proj"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let src = from.join("projects").join(project_slug(&cwd));
+        std::fs::create_dir_all(src.join("s1/subagents")).unwrap();
+        std::fs::write(src.join("s1.jsonl"), "{}\n").unwrap();
+        std::fs::write(src.join("s1/subagents/x.jsonl"), "{}\n").unwrap();
+        carry_session(&from, &to, &cwd, "s1");
+        let dst = to.join("projects").join(project_slug(&cwd));
+        assert!(dst.join("s1.jsonl").is_file());
+        assert!(dst.join("s1/subagents/x.jsonl").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

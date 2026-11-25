@@ -24,6 +24,9 @@ pub struct Picker {
     list: gtk::ListBox,
     remember: gtk::CheckButton,
     start: gtk::Button,
+    /// Profiles (Claude Code configs) to run on, and the chosen one.
+    profiles: Vec<String>,
+    profile: RefCell<String>,
     names: RefCell<Vec<String>>,
     selected: RefCell<Option<String>>,
     answered: Cell<bool>,
@@ -66,13 +69,33 @@ impl Picker {
         head.append(&refresh);
         root.append(&head);
 
+        let profiles: Vec<claude_deck::accounts::Account> = claude_deck::accounts::profiles();
+        let profile_names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+        let profile_drop = (profiles.len() > 1).then(|| {
+            let items: Vec<String> = profiles.iter().map(|p| format!("{}  ·  {}", p.name, model::short_path(&p.dir().to_string_lossy()))).collect();
+            let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            let l = label("Profile", &["heading"]);
+            l.set_tooltip_text(Some("The Claude Code config the session runs on: settings, plugins, MCP and history. Token accounts run on any profile; a logged-in account on its own."));
+            row.append(&l);
+            let drop = gtk::DropDown::from_strings(&refs);
+            drop.set_hexpand(true);
+            row.append(&drop);
+            root.append(&row);
+            drop
+        });
+
         let list = gtk::ListBox::new();
         list.add_css_class("boxed-list");
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.set_activate_on_single_click(false);
         root.append(&list);
 
-        let remember = gtk::CheckButton::with_label("Always use this account in this folder");
+        let remember = gtk::CheckButton::with_label(if profile_drop.is_some() {
+            "Always use this account and profile in this folder"
+        } else {
+            "Always use this account in this folder"
+        });
         root.append(&remember);
 
         let foot = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -95,6 +118,14 @@ impl Picker {
             .or_else(|| model::best(&deck.accounts.borrow(), &cfg, None).map(|a| a.name.clone()))
             .or_else(|| deck.accounts.borrow().first().map(|a| a.name.clone()));
         remember.set_active(mapped.is_some());
+        let initial_profile = cfg
+            .profile_for(Path::new(&req.cwd))
+            .filter(|p| profile_names.contains(p))
+            .or_else(|| mapped.clone().filter(|m| profile_names.contains(m)))
+            .unwrap_or_else(|| claude_deck::accounts::DEFAULT.to_string());
+        if let Some(d) = &profile_drop {
+            d.set_selected(profile_names.iter().position(|p| *p == initial_profile).unwrap_or(0) as u32);
+        }
 
         let p = Rc::new(Picker {
             req,
@@ -103,12 +134,25 @@ impl Picker {
             list,
             remember,
             start,
+            profiles: profile_names,
+            profile: RefCell::new(initial_profile),
             names: RefCell::new(vec![]),
             selected: RefCell::new(initial),
             answered: Cell::new(false),
             building: Cell::new(false),
         });
         p.rebuild();
+
+        if let Some(d) = &profile_drop {
+            let me = p.clone();
+            d.connect_selected_notify(move |d| {
+                let n = me.profiles.get(d.selected() as usize).cloned();
+                if let Some(n) = n {
+                    *me.profile.borrow_mut() = n;
+                    me.rebuild();
+                }
+            });
+        }
 
         let me = p.clone();
         p.list.connect_row_selected(move |_, row| {
@@ -172,7 +216,7 @@ impl Picker {
             if !me.answered.get() {
                 me.answered.set(true);
                 if let Some(d) = me.deck.upgrade() {
-                    d.answer_pick(&me.req, None, false);
+                    d.answer_pick(&me.req, None, None, false);
                 }
             }
         });
@@ -194,9 +238,16 @@ impl Picker {
         self.list.remove_all();
         let cfg = deck.config.borrow().clone();
         let mapped = cfg.account_for(Path::new(&self.req.cwd));
-        let accs = deck.accounts.borrow().clone();
+        // On a profile: its own login, plus the token accounts (they run on any profile).
+        let profile = self.profile.borrow().clone();
+        let accs: Vec<model::AccountInfo> =
+            deck.accounts.borrow().iter().filter(|a| !a.has_login || a.name == profile).cloned().collect();
         *self.names.borrow_mut() = accs.iter().map(|a| a.name.clone()).collect();
-        let selected = self.selected.borrow().clone();
+        let mut selected = self.selected.borrow().clone();
+        if !selected.as_ref().is_some_and(|s| accs.iter().any(|a| &a.name == s)) {
+            selected = accs.first().map(|a| a.name.clone());
+            *self.selected.borrow_mut() = selected.clone();
+        }
         for (i, acc) in accs.iter().enumerate() {
             let row = gtk::ListBoxRow::new();
             let h = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -249,7 +300,8 @@ impl Picker {
         }
         self.answered.set(true);
         if let Some(d) = self.deck.upgrade() {
-            d.answer_pick(&self.req, Some(name), self.remember.is_active());
+            let profile = self.profile.borrow().clone();
+            d.answer_pick(&self.req, Some(name), Some(&profile), self.remember.is_active());
         }
         self.dialog.close();
     }

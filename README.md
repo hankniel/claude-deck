@@ -174,6 +174,38 @@ claude-deck list              # usage of every account
 claude-deck rm personal
 ```
 
+An account can also run on a Claude Code config dir of its own instead of `~/.claude` — for
+example a work setup started with `CLAUDE_CONFIG_DIR=~/.claude-work claude`. Its sessions get
+that dir as `CLAUDE_CONFIG_DIR`, so they use its login (`/login` there), settings, plugins, MCP
+servers and history; usage and stats come from that login as for `default`. Moving a
+conversation between `~/.claude` and such an account copies its transcript across, so
+`--resume` finds it.
+
+```bash
+claude-deck add work --config-dir ~/.claude-work
+```
+
+### Profiles
+
+A **profile** is the Claude Code config a session runs on: `default` (`~/.claude`) and the dir of
+each config-dir account, named after it. A session is an account on a profile:
+
+- a logged-in account (`default`, config-dir accounts) runs only on its own profile, where its
+  login lives;
+- a token account runs on any profile (`CLAUDE_CONFIG_DIR` of the profile plus its token).
+
+When starting `claude`, CC Deck's popup asks for the profile and then the account (the profile's
+own login, or a token account); the terminal prompt asks for the account, then the profile for a
+token account. Switching a session to a token account keeps its profile; switching to a logged-in
+account moves it to that account's profile.
+
+```bash
+claude-deck profiles                                   # default, work, …
+claude-deck map personal ~/work/acme --profile work    # folder default: account + profile
+claude-deck run personal --profile work
+eval "$(claude-deck env personal --profile work)"
+```
+
 Older versions made a config dir per account under `~/.local/share/claude-deck/profiles/`.
 Those are no longer used (they are left on disk); add the accounts again with `claude-deck add`.
 

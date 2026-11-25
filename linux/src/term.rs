@@ -15,9 +15,22 @@ use vte::prelude::*;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClaudeRun {
     pub account: String,
+    /// The Claude Code config (profile) the session runs on.
+    pub profile: String,
     pub session_id: Option<String>,
     pub cwd: String,
     pub started: std::time::SystemTime,
+}
+
+impl ClaudeRun {
+    /// "work", or "work @ bravestars" for a token account on another profile.
+    pub fn label(&self) -> String {
+        if self.profile == self.account || self.profile == claude_deck::accounts::DEFAULT {
+            self.account.clone()
+        } else {
+            format!("{} @ {}", self.account, self.profile)
+        }
+    }
 }
 
 pub struct Tab {
@@ -262,39 +275,56 @@ impl Tab {
         });
 
         // A click on a link opens it (OSC 8 hyperlinks or plain URLs); a drag doesn't.
-        // Capture phase: with mouse tracking on (Claude Code), VTE takes the click for the app
-        // and a bubble-phase gesture never sees the release. The event still reaches VTE.
-        let click = gtk::GestureClick::new();
-        click.set_button(1);
+        // A legacy controller, not a GestureClick: VTE's own click gesture claims the press,
+        // which cancels any other gesture on the terminal before its release. Raw events are
+        // seen in the capture phase whatever VTE (or Claude Code's mouse tracking) does with them.
+        let click = gtk::EventControllerLegacy::new();
         click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let down: Rc<RefCell<Option<(f64, f64, String)>>> = Rc::new(RefCell::new(None));
-        let (d1, me1) = (down.clone(), Rc::downgrade(self));
-        click.connect_pressed(move |_, n, x, y| {
-            let Some(tab) = me1.upgrade() else { return };
-            let uri = (n == 1)
-                .then(|| {
-                    tab.term
+        let down: RefCell<Option<(f64, f64, String)>> = RefCell::new(None);
+        let me = Rc::downgrade(self);
+        click.connect_event(move |c, ev| {
+            let Some(tab) = me.upgrade() else { return glib::Propagation::Proceed };
+            let is_left = ev.downcast_ref::<gdk::ButtonEvent>().is_some_and(|b| b.button() == 1);
+            if !is_left {
+                return glib::Propagation::Proceed;
+            }
+            let Some((x, y)) = ev.position().and_then(|(wx, wy)| {
+                let w = c.widget()?;
+                let native = w.native()?;
+                let (nx, ny) = native.surface_transform();
+                let p = native.compute_point(&w, &gtk::graphene::Point::new((wx - nx) as f32, (wy - ny) as f32))?;
+                Some((p.x() as f64, p.y() as f64))
+            }) else {
+                return glib::Propagation::Proceed;
+            };
+            match ev.event_type() {
+                gdk::EventType::ButtonPress => {
+                    let uri = tab
+                        .term
                         .check_hyperlink_at(x, y)
                         .map(|s| s.to_string())
-                        .or_else(|| tab.term.check_match_at(x, y).0.map(|s| s.to_string()))
-                })
-                .flatten();
-            *d1.borrow_mut() = uri.map(|u| (x, y, u));
-        });
-        let me = Rc::downgrade(self);
-        click.connect_released(move |_, _, x, y| {
-            let Some(tab) = me.upgrade() else { return };
-            let Some((x0, y0, uri)) = down.borrow_mut().take() else { return };
-            if (x - x0).abs() > 4.0 || (y - y0).abs() > 4.0 {
-                return;
-            }
-            let win = tab.term.root().and_then(|r| r.downcast::<gtk::Window>().ok());
-            let fallback = uri.clone();
-            gtk::UriLauncher::new(&uri).launch(win.as_ref(), None::<&gio::Cancellable>, move |res| {
-                if res.is_err() {
-                    let _ = gio::AppInfo::launch_default_for_uri(&fallback, None::<&gio::AppLaunchContext>);
+                        .or_else(|| tab.term.check_match_at(x, y).0.map(|s| s.to_string()));
+                    *down.borrow_mut() = uri.map(|u| (x, y, u));
                 }
-            });
+                gdk::EventType::ButtonRelease => {
+                    let Some((x0, y0, uri)) = down.borrow_mut().take() else { return glib::Propagation::Proceed };
+                    if (x - x0).abs() > 4.0 || (y - y0).abs() > 4.0 {
+                        return glib::Propagation::Proceed;
+                    }
+                    let win = tab.term.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+                    let fallback = uri.clone();
+                    gtk::UriLauncher::new(&uri).launch(win.as_ref(), None::<&gio::Cancellable>, move |res| {
+                        if let Err(e) = res {
+                            eprintln!("cc-deck: opening {fallback}: {e}; trying the default handler");
+                            if let Err(e) = gio::AppInfo::launch_default_for_uri(&fallback, None::<&gio::AppLaunchContext>) {
+                                eprintln!("cc-deck: opening {fallback}: {e}");
+                            }
+                        }
+                    });
+                }
+                _ => {}
+            }
+            glib::Propagation::Proceed
         });
         self.term.add_controller(click);
     }
@@ -302,7 +332,7 @@ impl Tab {
     pub fn display_title(&self) -> String {
         let title = self.title.borrow();
         if let Some(c) = self.claude.borrow().as_ref() {
-            return if title.is_empty() { format!("Claude · {}", c.account) } else { title.clone() };
+            return if title.is_empty() { format!("Claude · {}", c.label()) } else { title.clone() };
         }
         if !title.is_empty() {
             return title.clone();
@@ -317,7 +347,7 @@ impl Tab {
 
     pub fn subtitle(&self) -> String {
         if let Some(c) = self.claude.borrow().as_ref() {
-            return format!("{} · {}", c.account, crate::model::last_component(&c.cwd));
+            return format!("{} · {}", c.label(), crate::model::last_component(&c.cwd));
         }
         let cwd = self.cwd.borrow();
         if *cwd == home().to_string_lossy() {
